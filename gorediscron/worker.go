@@ -7,13 +7,12 @@ import (
 	"time"
 
 	"github.com/namtph/go-redis-cron/gorediscron/internal"
-	"github.com/redis/go-redis/v9"
 )
 
-const workerPollInterval = 2 * time.Second
+const reaperInterval = 5 * time.Second
 
-// StartWorkers configures how many goroutines dequeue and execute runs.
-// Call before Start.
+// StartWorkers configures how many goroutines execute runs from the local queue.
+// Call before StartWith Workers mode.
 func (s *Scheduler) StartWorkers(n int) error {
 	if n < 1 {
 		return errors.New("gorediscron: worker count must be at least 1")
@@ -44,44 +43,120 @@ func (s *Scheduler) runWorkers(ctx context.Context) {
 	wg.Wait()
 }
 
-func (s *Scheduler) workerLoop(ctx context.Context) {
+func (s *Scheduler) runClaimLoop(ctx context.Context) {
+	backoff := s.cfg.claimBackoff()
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		task, err := s.queue.Dequeue(ctx, workerPollInterval)
+		if !s.local.TryReserve() {
+			s.sleep(ctx, backoff)
+			continue
+		}
+		task, ok, err := s.queue.ClaimPending(ctx, s.cfg.InstanceID)
 		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return
-			}
-			if errors.Is(err, redis.Nil) {
+			s.local.ReleaseSlot()
+			s.log.Error("claim pending failed", "err", err)
+			s.sleep(ctx, backoff)
+			continue
+		}
+		if !ok {
+			s.local.ReleaseSlot()
+			s.sleep(ctx, backoff)
+			continue
+		}
+		s.metrics.IncClaim()
+
+		claimed, err := s.queue.TryClaimRun(ctx, s.cfg.Namespace, s.cfg.InstanceID, task.Name, task.ScheduledAt)
+		if err != nil {
+			s.local.ReleaseSlot()
+			_ = s.requeueRun(ctx, task)
+			s.sleep(ctx, backoff)
+			continue
+		}
+		if !claimed {
+			s.local.ReleaseSlot()
+			_ = s.queue.Ack(ctx, task)
+			continue
+		}
+
+		if err := s.local.Enqueue(task); err != nil {
+			s.local.ReleaseSlot()
+			_ = s.requeueRun(ctx, task)
+			s.sleep(ctx, backoff)
+			continue
+		}
+	}
+}
+
+func (s *Scheduler) runReaper(ctx context.Context) {
+	ticker := time.NewTicker(reaperInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := s.queue.ReclaimExpired(ctx)
+			if err != nil {
+				s.log.Error("reclaim expired runs", "err", err)
 				continue
 			}
-			s.log.Error("dequeue failed", "err", err)
-			continue
+			if n > 0 {
+				s.metrics.IncRequeue()
+				s.log.Info("reclaimed expired runs", "count", n)
+			}
+		}
+	}
+}
+
+func (s *Scheduler) requeueRun(ctx context.Context, task internal.RunTask) error {
+	_ = s.queue.ReleaseClaim(ctx, s.cfg.Namespace, task.Name, task.ScheduledAt)
+	if err := s.queue.Requeue(ctx, task); err != nil {
+		s.log.Error("requeue run failed", "name", task.Name, "err", err)
+		return err
+	}
+	s.metrics.IncRequeue()
+	return nil
+}
+
+func (s *Scheduler) sleep(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	select {
+	case <-ctx.Done():
+		t.Stop()
+	case <-t.C:
+	}
+}
+
+func (s *Scheduler) workerLoop(ctx context.Context) {
+	for {
+		task, err := s.local.Dequeue(ctx)
+		if err != nil {
+			return
 		}
 		s.handleRun(ctx, task)
 	}
 }
 
 func (s *Scheduler) handleRun(parent context.Context, task internal.RunTask) {
+	ack := func() {
+		if err := s.queue.Ack(parent, task); err != nil {
+			s.log.Error("ack run failed", "name", task.Name, "err", err)
+			return
+		}
+		s.metrics.IncAck()
+	}
+
 	rec, ok := s.registry.get(task.Name)
 	if !ok || rec.stopped {
 		s.registry.markRun(task.Name, RunStatusSkipped, nil)
+		ack()
 		return
 	}
 	if task.Version < rec.version {
 		s.registry.markRun(task.Name, RunStatusSkipped, nil)
-		return
-	}
-
-	claimed, err := s.queue.TryClaimRun(parent, s.cfg.Namespace, s.cfg.InstanceID, task.Name, task.ScheduledAt)
-	if err != nil {
-		s.log.Error("claim run failed", "name", task.Name, "err", err)
-		return
-	}
-	if !claimed {
-		s.registry.markRun(task.Name, RunStatusSkipped, nil)
+		ack()
 		return
 	}
 
@@ -90,10 +165,12 @@ func (s *Scheduler) handleRun(parent context.Context, task internal.RunTask) {
 		begin, err := s.queue.TryBeginActive(parent, s.cfg.Namespace, s.cfg.InstanceID, task.Name)
 		if err != nil {
 			s.log.Error("active lock failed", "name", task.Name, "err", err)
+			_ = s.requeueRun(parent, task)
 			return
 		}
 		if !begin {
 			s.registry.markRun(task.Name, RunStatusSkipped, nil)
+			_ = s.requeueRun(parent, task)
 			return
 		}
 		releaseActive = func() {
@@ -111,12 +188,15 @@ func (s *Scheduler) handleRun(parent context.Context, task internal.RunTask) {
 
 	if errors.Is(runErr, context.Canceled) {
 		s.registry.markRun(task.Name, RunStatusSkipped, runErr)
+		ack()
 		return
 	}
 	if runErr != nil {
 		s.registry.markRun(task.Name, RunStatusFailed, runErr)
 		s.log.Error("job failed", "name", task.Name, "err", runErr)
+		ack()
 		return
 	}
 	s.registry.markRun(task.Name, RunStatusSuccess, nil)
+	ack()
 }

@@ -13,7 +13,22 @@ func LeaderKey(namespace string) string {
 
 // RunQueueKey is the list of pending job runs.
 func RunQueueKey(namespace string) string {
-	return fmt.Sprintf("%s:runs", tag(namespace))
+	return fmt.Sprintf("%s:runs:pending", tag(namespace))
+}
+
+// RunProcessingListKey holds runs claimed from pending but not yet acked.
+func RunProcessingListKey(namespace string) string {
+	return fmt.Sprintf("%s:runs:processing", tag(namespace))
+}
+
+// RunProcessingMetaKey maps raw task JSON to worker|deadlineMs.
+func RunProcessingMetaKey(namespace string) string {
+	return fmt.Sprintf("%s:runs:processing:meta", tag(namespace))
+}
+
+// RunLeaseKey is a ZSET of processing tasks by lease deadline (ms).
+func RunLeaseKey(namespace string) string {
+	return fmt.Sprintf("%s:runs:leases", tag(namespace))
 }
 
 // RunClaimKey deduplicates a scheduled tick across pods.
