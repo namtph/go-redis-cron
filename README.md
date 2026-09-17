@@ -7,7 +7,7 @@ A small Go library for running cron schedules across multiple pods with Redis-ba
 | Area | Path | Description |
 |------|------|-------------|
 | **Scheduler** | [`gorediscron/`](gorediscron/) | Core library: Redis leader election + cron execution |
-| **Job UI** | [`ui/`](ui/) | Embedded static dashboard and JSON API; mounts for Gin, Echo, and mux |
+| **Job UI** | [`ui/`](ui/) | Embedded static dashboard and JSON API (`net/http.Handler`) |
 | **Demo** | [`demo/`](demo/) | Local Redis + sample HTTP server to test multi-instance behavior |
 
 ## Problem
@@ -21,8 +21,7 @@ When you run the same service in multiple replicas, a plain in-process cron sche
 - Cron schedules via [robfig/cron](https://github.com/robfig/cron) (5- or 6-field expressions)
 - Redis leader election with lease renewal (`SET NX` + TTL heartbeat)
 - Safe to call `Start()` on every pod; non-leaders skip job execution
-- Built-in static job viewer (`GET /cron/` by default)
-- Mount helpers: `ui/gin`, `ui/echo`, `ui/mux`
+- Built-in static job viewer (`GET /cron/` by default), served as `http.Handler`
 
 ## Requirements
 
@@ -80,24 +79,17 @@ func main() {
 
 The `ui` package embeds a small static site and `GET …/api/jobs` JSON. Pass any `JobSource` (the scheduler implements `Jobs()`).
 
-**stdlib / custom router** — use `ui.Handler`:
+Mount `ui.Handler` on your HTTP server (stdlib, Gin, Echo, chi, etc. all accept `http.Handler`):
 
 ```go
-http.Handle("/cron/", ui.Handler(sched, ui.Options{Prefix: "/cron"}))
+mux := http.NewServeMux()
+mux.Handle("/", ui.Handler(sched, ui.Options{Prefix: "/cron"}))
+http.ListenAndServe(":8080", mux)
 ```
 
-**Gin**
+With Gin: `r.Any("/cron/*path", gin.WrapH(ui.Handler(sched, uiOpts)))`.
 
-```go
-import uigin "github.com/namtph/go-redis-cron/ui/gin"
-
-uigin.Mount(r, sched, ui.Options{Prefix: "/cron"})
-```
-
-**Echo** — `github.com/namtph/go-redis-cron/ui/echo`  
-**mux** — `github.com/namtph/go-redis-cron/ui/mux`
-
-See [`demo/cmd/server`](demo/cmd/server/main.go) for a working example with `-framework gin|echo|mux`.
+See [`demo/cmd/server`](demo/cmd/server/main.go) for a minimal `net/http` example.
 
 ## Demo
 

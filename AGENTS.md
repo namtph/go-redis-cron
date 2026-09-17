@@ -5,7 +5,7 @@
 Go monorepo with three deliverables:
 
 1. **`gorediscron`** — distributed cron scheduler (Redis leader election + in-process cron).
-2. **`ui`** — embedded static job dashboard + JSON API; optional mounts for Gin, Echo, and gorilla/mux.
+2. **`ui`** — embedded static job dashboard + JSON API (`http.Handler` only).
 3. **`demo`** — runnable server and Docker Compose Redis for manual and integration testing.
 
 **Non-goals:** general-purpose task queue, delayed jobs, workflow engine, separate worker processes.
@@ -21,10 +21,9 @@ ui/
   handler.go          # embed static + stdlib mux
   api.go              # GET /api/jobs
   static/             # index.html, app.js, app.css
-  gin/ echo/ mux/     # framework mount helpers (optional deps)
 demo/
   docker-compose.yml  # Redis 7
-  cmd/server/         # flags: -framework, -instance, -redis, -ui-prefix
+  cmd/server/         # net/http; flags: -instance, -redis, -ui-prefix
 ```
 
 ## Architecture
@@ -65,8 +64,6 @@ Every pod may expose the UI (read-only job snapshot). Only the leader executes `
 | `github.com/redis/go-redis/v9` | Redis client |
 | `github.com/robfig/cron/v3` | Cron parsing |
 | `github.com/alicebob/miniredis/v2` | Tests |
-| gin / echo / mux | Demo + `ui/*` mounts only |
-
 ## Coding conventions
 
 - Go 1.22+, `context.Context` on `Start`, `Stop`, and job callbacks
@@ -74,7 +71,7 @@ Every pod may expose the UI (read-only job snapshot). Only the leader executes `
 - Register jobs with stable `id`, display `name`, and cron `spec`
 - Table-driven tests; miniredis for leader tests
 - No inline imports; exhaustive switches on enums/unions
-- Keep framework adapters thin — delegate to `ui.Handler`
+- Do not add Gin/Echo/mux dependencies; users wrap `ui.Handler` themselves if needed
 
 ## Testing checklist
 
