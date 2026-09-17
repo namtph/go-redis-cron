@@ -2,100 +2,67 @@
 
 ## Project purpose
 
-Small Go library: run cron schedules safely across multiple pods using Redis leader election. Every replica may start the scheduler; only the elected leader executes job callbacks.
+Go monorepo:
 
-**Non-goals:** distributed task queue, delayed jobs, workflow orchestration, HTTP workers. Keep the API minimal.
+1. **`gorediscron`** — distributed cron scheduler (Redis leader election, run queue, in-pod workers).
+2. **`ui`** — embedded static job dashboard + JSON API (`http.Handler` only).
+3. **`examples/`** — standalone runnable programs (each with `main`, `go.mod`, and `docker-compose.yml`).
 
-## Architecture
+**Non-goals:** general-purpose task queue, delayed jobs, workflow engine as a separate product.
+
+## Repository layout
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Pod A     │     │   Pod B     │     │   Pod C     │
-│  Scheduler  │     │  Scheduler  │     │  Scheduler  │
-│  + cron     │     │  + cron     │     │  + cron     │
-└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
-       │                   │                   │
-       └───────────────────┼───────────────────┘
-                           ▼
-                    ┌─────────────┐
-                    │    Redis    │
-                    │ leader lock │
-                    │  (SET NX)   │
-                    └─────────────┘
+gorediscron/          # import: github.com/namtph/go-redis-cron/gorediscron
+ui/                   # import: github.com/namtph/go-redis-cron/ui
+examples/
+  full-pod/           # register + workers + UI on one process
+  scheduler-pod/      # cron leader + job registration only
+  worker-pod/         # worker pool + claim loop only
+docs/META.md          # runtime contract
 ```
 
-### Core components (target layout)
-
-| Package / file | Responsibility |
-|----------------|----------------|
-| `scheduler.go` | Public `Scheduler`, `Config`, `New`, `AddFunc`, `Start`, `Stop` |
-| `leader.go` | Acquire, renew, release lease; `OnPromoted` / `OnDemoted` hooks |
-| `keys.go` | Namespaced Redis key helpers (`{namespace}:leader`, etc.) |
-| `doc.go` | Package documentation for `go doc` |
-
-### Leader election rules
-
-- Acquire with `SET key instanceID NX PX <ttl>`.
-- Renew only when value matches `InstanceID` (Lua or `GET` + conditional `PEXPIRE`).
-- Renewal interval ≈ `LeaseTTL / 3`.
-- On demotion: stop cron ticks immediately; do not run callbacks.
-- On `Stop`: cancel context, release lease if leader, wait for in-flight job (with timeout).
-
-### Redis Cluster
-
-Keys touched in one atomic script must share a hash tag: `{namespace}:leader`, `{namespace}:fence`, etc.
+Each example uses `replace github.com/namtph/go-redis-cron => ../..` in its `go.mod`.
 
 ## Dependencies
 
-- `github.com/redis/go-redis/v9` — Redis client
-- `github.com/robfig/cron/v3` — cron parsing and scheduling
-- `github.com/alicebob/miniredis/v2` — unit/integration tests (test only)
+| Module | Use |
+|--------|-----|
+| `github.com/redis/go-redis/v9` | Redis client |
+| `github.com/robfig/cron/v3` | Cron parsing |
+| `github.com/alicebob/miniredis/v2` | Tests |
 
-Avoid heavy frameworks. Prefer stdlib + small, well-known libraries.
+No Gin/Echo in the library; examples use `net/http` only.
 
 ## Coding conventions
 
-- Go 1.22+. Use `context.Context` on public APIs (`Start`, `Stop`, job callbacks).
-- Job signature: `func(ctx context.Context) error`.
-- Export only what users need; keep leader logic internal or in `internal/`.
-- Table-driven tests; cover leader failover, duplicate `Start`, and graceful `Stop`.
-- No inline imports. Exhaustive switches on enums/unions with `default: var _ T = x; panic("unhandled")` or equivalent.
-- Errors: wrap with `%w`; return typed errors only when callers need to branch.
-
-## Testing checklist
-
-- [ ] Single instance acquires lease and runs job on schedule
-- [ ] Second instance does not run jobs while first holds lease
-- [ ] Lease expiry promotes standby within `LeaseTTL + renewal slack`
-- [ ] `Stop` on leader allows follower to take over
-- [ ] Duplicate `InstanceID` is rejected or documented as unsafe
-- [ ] Namespace isolates keys between deployments
+- Go 1.22+, `context.Context` on lifecycle and job callbacks
+- No inline imports; exhaustive switches on enums/unions
+- Table-driven tests; `go test ./...` and `go vet ./...` from repo root
 
 ## Agent workflow
 
 1. **Default branch:** At the start of every task, run `git checkout dev` and `git pull origin dev`, unless the user or task gives different branch instructions.
 2. Read existing code before adding types or dependencies.
-3. Prefer focused diffs; do not scaffold unrelated tooling unless asked.
+3. Prefer focused diffs; keep scheduler / ui / examples scoped.
 4. Run `go test ./...` and `go vet ./...` before finishing.
-5. Update README examples when the public API changes.
+5. Update `README.md` and `examples/README.md` when public API or example flags change.
 6. Do not commit secrets, `.env` files, or local Redis dumps.
 
-## Public API sketch (stable target)
+## Public API (scheduler)
 
 ```go
-type Config struct {
-    Namespace  string
-    InstanceID string
-    LeaseTTL   time.Duration
-    Logger     Logger // optional
-}
-
 func New(rdb redis.UniversalClient, cfg Config) (*Scheduler, error)
-func (s *Scheduler) AddFunc(spec string, fn JobFunc) error
+func (s *Scheduler) Register(def CronJobScheduler) error
+func (s *Scheduler) StartLeaderElection(ctx context.Context) error
+func (s *Scheduler) StartCron(ctx context.Context) error
+func (s *Scheduler) StartWorkerPool(ctx context.Context, cfg WorkerPoolConfig) error
 func (s *Scheduler) Start(ctx context.Context) error
+func (s *Scheduler) StartWith(ctx context.Context, mode StartMode) error
 func (s *Scheduler) Stop(ctx context.Context) error
-
-type JobFunc func(ctx context.Context) error
+func (s *Scheduler) Jobs() []Job
 ```
 
-Adjust names to match implementation, but keep this shape unless the user requests otherwise.
+`WorkerPoolConfig` holds `NumberOfWorkerInstances` (required ≥ 1 when starting the pool).
+
+See [docs/META.md](docs/META.md).
