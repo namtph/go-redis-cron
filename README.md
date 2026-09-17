@@ -19,35 +19,48 @@ Design contract: [docs/META.md](docs/META.md).
 - **Worker pool on every pod**: in-pod claim loop (reserve → Redis claim → local queue) + executors
 - Idempotent `Register` with version-guarded metadata in Redis
 - Split deployments via `StartWith` (scheduler-only vs worker-only pods)
+- **No enforced startup order** between `Register` and worker/cron/leader hooks
 - Optional `Metrics` hook (claims, requeues, OOM, local queue depth)
 
-## Scheduler quick start (full pod)
+## Scheduler API (library — no required order)
+
+Each call is independent. Typical pieces:
+
+| Call | Purpose |
+|------|---------|
+| `Register` | Idempotent job + Redis metadata; anytime, repeat as needed |
+| `SetWorkerCount(n)` | Configure worker goroutines (does not start them) |
+| `StartLeaderElection(ctx)` | Redis leader loop |
+| `StartCron(ctx)` | Cron engine (empty until you `Register`) |
+| `StartWorkerPool(ctx)` | Claim loop + workers + reaper (default 1 worker if count unset) |
+| `StartWith(ctx, mode)` | Optional convenience bundle |
+| `Start(ctx)` | Leader election + cron only (not worker pool) |
 
 ```go
-sched, _ := gorediscron.New(rdb, gorediscron.Config{
-	Namespace:  "billing",
-	InstanceID: podName,
-	LeaseTTL:   10 * time.Second,
-})
+// Any order, e.g. workers first, register later:
+_ = sched.StartWorkerPool(ctx)
+_ = sched.Register(gorediscron.CronJobScheduler{...})
+_ = sched.Register(gorediscron.CronJobScheduler{...}) // again later
 
-_ = sched.Register(gorediscron.CronJobScheduler{
-	Name: "hourly-report",
-	Cron: "0 * * * *",
-	Fn:   func(ctx context.Context) error { return nil },
-})
-_ = sched.StartWorkers(2)
-_ = sched.Start(context.Background()) // FullStartMode: election + cron + workers
+// Or register only (persist metadata, no goroutines):
+_ = sched.Register(gorediscron.CronJobScheduler{...})
+
+// Full pod example:
+_ = sched.SetWorkerCount(2)
+_ = sched.StartWorkerPool(ctx)
+_ = sched.StartLeaderElection(ctx)
+_ = sched.StartCron(ctx)
+_ = sched.Register(gorediscron.CronJobScheduler{Name: "hourly-report", Cron: "0 * * * *", Fn: fn})
 ```
 
 ## Split pods
 
 ```go
-// Scheduler pod: register + cron ticks only
-_ = sched.StartWith(ctx, gorediscron.SchedulerPodMode())
+_ = sched.Register(...) // as needed
+_ = sched.StartWith(ctx, gorediscron.SchedulerPodMode()) // election + cron, no workers
 
-// Worker pod: must Register locally for Fn; runs claim loop + workers
-_ = sched.StartWorkers(4)
-_ = sched.StartWith(ctx, gorediscron.WorkerPodMode())
+_ = sched.SetWorkerCount(4)
+_ = sched.StartWith(ctx, gorediscron.WorkerPodMode()) // workers only
 ```
 
 ## How it works

@@ -4,10 +4,12 @@ This document is the product contract for `gorediscron`. API mapping:
 
 | META | gorediscron |
 |------|-------------|
-| `registerJobs` | `Register(CronJobScheduler)` |
-| `startWorkerPool` | `StartWorkers(n)` + worker goroutines via `StartWith` |
-| `startLeader` (claim loop) | `StartWith` with `Workers: true` (claim loop + reaper) |
-| Cron tick enqueue | Leader cron → `RunQueue.Enqueue` (scheduler pod) |
+| `registerJobs` | `Register(CronJobScheduler)` — **anytime**, repeatable |
+| `startWorkerPool` | `SetWorkerCount` + `StartWorkerPool(ctx)` — **not tied to Register** |
+| `startLeader` (claim loop) | Started inside `StartWorkerPool` |
+| Cron tick enqueue | `StartCron` + leader; optional `StartLeaderElection` |
+
+**Library, not a framework:** no required order. Examples: register-only; worker pool then register; register many times after workers are running.
 
 ## 1. Pod topology (homogeneous or split)
 
