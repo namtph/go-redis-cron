@@ -1,6 +1,14 @@
 # go-redis-cron
 
-A small Go library for running cron schedules across multiple pods with Redis-backed leader election. Only one instance executes each tick cluster-wide.
+A small Go library for running cron schedules across multiple pods with Redis-backed leader election, plus an optional embedded job dashboard.
+
+## Repository layout
+
+| Area | Path | Description |
+|------|------|-------------|
+| **Scheduler** | [`gorediscron/`](gorediscron/) | Core library: Redis leader election + cron execution |
+| **Job UI** | [`ui/`](ui/) | Embedded static dashboard and JSON API (`net/http.Handler`) |
+| **Demo** | [`demo/`](demo/) | Local Redis + sample HTTP server to test multi-instance behavior |
 
 ## Problem
 
@@ -10,11 +18,10 @@ When you run the same service in multiple replicas, a plain in-process cron sche
 
 ## Features
 
-- Cron schedules via [robfig/cron](https://github.com/robfig/cron)
+- Cron schedules via [robfig/cron](https://github.com/robfig/cron) (5- or 6-field expressions)
 - Redis leader election with lease renewal (`SET NX` + TTL heartbeat)
-- Safe to call `Start()` on every pod; non-leaders wait quietly
-- Graceful shutdown releases the lease for faster failover
-- Minimal API surface — scheduler + job registration, no separate worker runtime
+- Safe to call `Start()` on every pod; non-leaders skip job execution
+- Built-in static job viewer (`GET /cron/` by default), served as `http.Handler`
 
 ## Requirements
 
@@ -24,10 +31,10 @@ When you run the same service in multiple replicas, a plain in-process cron sche
 ## Installation
 
 ```bash
-go get github.com/namtph/go-redis-cron
+go get github.com/namtph/go-redis-cron/gorediscron
 ```
 
-## Quick start
+## Scheduler quick start
 
 ```go
 package main
@@ -37,7 +44,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/namtph/go-redis-cron"
+	"github.com/namtph/go-redis-cron/gorediscron"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -45,18 +52,21 @@ func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 
 	sched, err := gorediscron.New(rdb, gorediscron.Config{
-		Namespace:  "billing",           // isolate keys per deployment
-		InstanceID: "billing-pod-abc123", // unique per replica
+		Namespace:  "billing",
+		InstanceID: "billing-pod-abc123",
 		LeaseTTL:   10 * time.Second,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	sched.AddFunc("0 * * * *", func(ctx context.Context) error {
+	err = sched.AddFunc("hourly-report", "Hourly report", "0 * * * *", func(ctx context.Context) error {
 		log.Println("hourly job ran once cluster-wide")
 		return nil
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	if err := sched.Start(context.Background()); err != nil {
 		log.Fatal(err)
@@ -65,61 +75,44 @@ func main() {
 }
 ```
 
-Run the same binary on every pod. Redis elects one leader; only that pod runs cron callbacks.
+## Job UI
+
+The `ui` package embeds a small static site and `GET …/api/jobs` JSON. Pass any `JobSource` (the scheduler implements `Jobs()`).
+
+Mount `ui.Handler` on your HTTP server (stdlib, Gin, Echo, chi, etc. all accept `http.Handler`):
+
+```go
+mux := http.NewServeMux()
+mux.Handle("/", ui.Handler(sched, ui.Options{Prefix: "/cron"}))
+http.ListenAndServe(":8080", mux)
+```
+
+With Gin: `r.Any("/cron/*path", gin.WrapH(ui.Handler(sched, uiOpts)))`.
+
+See [`demo/cmd/server`](demo/cmd/server/main.go) for a minimal `net/http` example.
+
+## Demo
+
+```bash
+make redis
+go run ./demo/cmd/server -instance demo-1 -addr :8080
+```
+
+Open http://localhost:8080/cron/ — details in [`demo/README.md`](demo/README.md).
 
 ## How it works
 
-```mermaid
-sequenceDiagram
-    participant P1 as Pod A
-    participant P2 as Pod B
-    participant R as Redis
-
-    P1->>R: SET leader NX PX (acquire)
-    R-->>P1: OK (leader)
-    P2->>R: SET leader NX PX
-    R-->>P2: nil (follower)
-
-    loop each LeaseTTL / 3
-        P1->>R: renew lease
-    end
-
-    P1->>P1: cron tick → run job
-
-    Note over P1: leader crashes or stops renewing
-    R-->>P2: lease expires
-    P2->>R: SET leader NX PX
-    R-->>P2: OK (new leader)
-    P2->>P2: cron tick → run job
-```
-
 1. Each pod tries to acquire a namespaced leader key in Redis.
 2. The leader renews the lease on an interval shorter than `LeaseTTL`.
-3. Only the leader registers and fires cron callbacks.
-4. On demotion or shutdown, the pod stops jobs and releases or lets the lease expire.
-
-## Configuration
-
-| Field | Description |
-|-------|-------------|
-| `Namespace` | Redis key prefix. Use a distinct value per service sharing a Redis DB. |
-| `InstanceID` | Unique replica identifier (pod name, hostname, etc.). Must not be reused by live processes. |
-| `LeaseTTL` | Leader lease duration. Should be several times the renewal interval. |
-| `Logger` | Optional structured logger; defaults to no-op. |
-
-## Guarantees and limits
-
-- **At-most-once per tick** across the cluster under normal operation.
-- Jobs should be **idempotent**. Failover during a tick can theoretically overlap with a slow previous run.
-- This library schedules and runs callbacks in-process. It is not a distributed task queue.
+3. Only the leader runs cron callbacks; followers mark runs as skipped.
+4. On demotion or shutdown, the pod stops holding the lease so another pod can take over.
 
 ## Development
 
 ```bash
-go test ./...
+make test
+make vet
 ```
-
-Integration tests use [miniredis](https://github.com/alicebob/miniredis) where possible.
 
 ## License
 
