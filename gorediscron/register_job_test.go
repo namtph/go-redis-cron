@@ -60,6 +60,25 @@ func TestRegisterJobBumpsVersionWhenCronChanges(t *testing.T) {
 	}
 }
 
+func TestRegisterJobSixFieldCron(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+
+	r, err := New(rdb, Config{Namespace: "v2", InstanceID: "a", LeaseTTL: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.RegisterTask("work", func(ctx context.Context, args ...any) error { return nil })
+
+	if err := r.RegisterJob(CronJob{Name: "fast", TaskName: "work", Cron: "*/1 * * * * *"}); err != nil {
+		t.Fatalf("six-field cron: %v", err)
+	}
+	rec, ok := r.registry.get("fast")
+	if !ok || rec.entryID == 0 {
+		t.Fatalf("expected cron entry, got %+v", rec)
+	}
+}
+
 func TestUnknownTaskSkipsRun(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})

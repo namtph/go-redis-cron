@@ -176,7 +176,11 @@ func (r *Runtime) bindCron(name, spec string) (cron.EntryID, error) {
 			r.registry.setNextRun(name, sched.Next(time.Now()))
 		}
 	}
-	return r.ensureCron().AddFunc(spec, wrapped)
+	sched, err := parseSpec(spec)
+	if err != nil {
+		return 0, err
+	}
+	return r.ensureCron().Schedule(sched, cron.FuncJob(wrapped)), nil
 }
 
 func (r *Runtime) persistJobMeta(ctx context.Context, job CronJob, jobID string, version int64, stopped bool) error {
