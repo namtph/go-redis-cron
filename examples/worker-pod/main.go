@@ -38,7 +38,7 @@ func main() {
 		log.Fatalf("redis ping: %v", err)
 	}
 
-	sched, err := gorediscron.New(rdb, gorediscron.Config{
+	rt, err := gorediscron.New(rdb, gorediscron.Config{
 		Namespace:  *namespace,
 		InstanceID: *instanceID,
 		LeaseTTL:   10 * time.Second,
@@ -47,14 +47,16 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Workers need the same job name + Fn locally to execute claimed runs (Redis holds metadata only).
-	if err := sched.Register(gorediscron.CronJobScheduler{
-		Name: "split-heartbeat",
-		Cron: "*/10 * * * * *",
-		Fn: func(ctx context.Context) error {
-			log.Printf("[%s] split-heartbeat executed on worker pod", *instanceID)
-			return nil
-		},
+	if err := rt.RegisterTask("split-heartbeat", func(ctx context.Context, args ...any) error {
+		log.Printf("[%s] split-heartbeat executed on worker pod", *instanceID)
+		return nil
+	}); err != nil {
+		log.Fatal(err)
+	}
+	if err := rt.RegisterJob(gorediscron.CronJob{
+		Name:     "split-heartbeat",
+		TaskName: "split-heartbeat",
+		Cron:     "*/10 * * * * *",
 	}); err != nil {
 		log.Fatal(err)
 	}
@@ -63,11 +65,11 @@ func main() {
 	defer stop()
 
 	pool := gorediscron.WorkerPoolConfig{NumberOfWorkerInstances: *workers}
-	if err := sched.StartWith(ctx, gorediscron.WorkerPodMode(pool)); err != nil {
+	if err := rt.StartWith(ctx, gorediscron.WorkerPodMode(pool)); err != nil {
 		log.Fatal(err)
 	}
 	defer func() {
-		_ = sched.Stop(context.Background())
+		_ = rt.Stop(context.Background())
 	}()
 
 	log.Printf("worker-pod running instance=%s workers=%d (waiting for claims)", *instanceID, *workers)

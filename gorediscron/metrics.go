@@ -9,6 +9,7 @@ type Metrics interface {
 	SetLocalQueueDepth(n int)
 	IncRegisterApplied()
 	IncRegisterSkipped()
+	IncUnknownTask()
 }
 
 type nopMetrics struct{}
@@ -20,6 +21,7 @@ func (nopMetrics) IncRedisOOM()           {}
 func (nopMetrics) SetLocalQueueDepth(int) {}
 func (nopMetrics) IncRegisterApplied()    {}
 func (nopMetrics) IncRegisterSkipped()    {}
+func (nopMetrics) IncUnknownTask()        {}
 
 func metricsOrNop(m Metrics) Metrics {
 	if m == nil {

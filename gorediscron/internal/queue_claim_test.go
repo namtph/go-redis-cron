@@ -12,7 +12,7 @@ import (
 func TestClaimPendingRequeue(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	q := NewRunQueue(rdb, "ns", nil)
+	q := NewRunQueue(nil, rdb, "ns", nil)
 	ctx := context.Background()
 
 	task := RunTask{Name: "job", Version: 1, ScheduledAt: time.Now().UnixMilli()}

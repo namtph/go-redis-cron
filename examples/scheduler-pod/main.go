@@ -38,7 +38,7 @@ func main() {
 		log.Fatalf("redis ping: %v", err)
 	}
 
-	sched, err := gorediscron.New(rdb, gorediscron.Config{
+	rt, err := gorediscron.New(rdb, gorediscron.Config{
 		Namespace:  *namespace,
 		InstanceID: *instanceID,
 		LeaseTTL:   10 * time.Second,
@@ -47,14 +47,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Scheduler pod owns registration and cron ticks (enqueue only).
-	if err := sched.Register(gorediscron.CronJobScheduler{
-		Name: "split-heartbeat",
-		Cron: "*/10 * * * * *",
-		Fn: func(ctx context.Context) error {
-			log.Printf("[%s] split-heartbeat (scheduler pod callback; workers execute elsewhere)", *instanceID)
-			return nil
-		},
+	_ = rt.RegisterTask("split-heartbeat", func(ctx context.Context, args ...any) error { return nil })
+
+	if err := rt.RegisterJob(gorediscron.CronJob{
+		Name:     "split-heartbeat",
+		TaskName: "split-heartbeat",
+		Cron:     "*/10 * * * * *",
 	}); err != nil {
 		log.Fatal(err)
 	}
@@ -62,15 +60,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := sched.StartWith(ctx, gorediscron.SchedulerPodMode()); err != nil {
+	if err := rt.StartWith(ctx, gorediscron.SchedulerPodMode()); err != nil {
 		log.Fatal(err)
 	}
 	defer func() {
-		_ = sched.Stop(context.Background())
+		_ = rt.Stop(context.Background())
 	}()
 
 	mux := http.NewServeMux()
-	mux.Handle("/", ui.Handler(sched, ui.Options{Prefix: *uiPrefix}))
+	mux.Handle("/", ui.Handler(rt, ui.Options{Prefix: *uiPrefix}))
 	srv := &http.Server{Addr: *addr, Handler: mux}
 
 	log.Printf("scheduler-pod listening on %s instance=%s ui=%s", *addr, *instanceID, *uiPrefix)

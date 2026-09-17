@@ -11,12 +11,15 @@ import (
 type schedRecord struct {
 	kind          JobKind
 	name          string
+	taskName      string
+	jobID         string
+	args          []any
 	cron          string
 	version       int64
 	allowParallel bool
 	timeout       time.Duration
 	stopped       bool
-	fn            JobFunc
+	fn            JobFunc // legacy Register only
 	entryID       cron.EntryID
 	nextRun       time.Time
 	lastRun       time.Time
@@ -71,7 +74,34 @@ func (r *schedulerRegistry) get(name string) (*schedRecord, bool) {
 	return rec, ok
 }
 
-func (r *schedulerRegistry) upsert(def CronJobScheduler, version int64, entryID cron.EntryID, next time.Time) *schedRecord {
+func (r *schedulerRegistry) upsertJob(job CronJob, jobID string, version int64, entryID cron.EntryID, next time.Time) *schedRecord {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	rec, exists := r.byName[job.Name]
+	if exists {
+		rec.cancelInFlight()
+	} else {
+		rec = &schedRecord{name: job.Name}
+		r.byName[job.Name] = rec
+		r.order = append(r.order, job.Name)
+	}
+
+	rec.kind = JobKindRepeat
+	rec.taskName = job.TaskName
+	rec.jobID = jobID
+	rec.args = job.Args
+	rec.cron = job.Cron
+	rec.version = version
+	rec.allowParallel = job.AllowParallel
+	rec.timeout = job.runTimeout()
+	rec.stopped = false
+	rec.entryID = entryID
+	rec.nextRun = next
+	return rec
+}
+
+func (r *schedulerRegistry) upsertLegacy(def CronJobScheduler, version int64, entryID cron.EntryID, next time.Time) *schedRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -85,6 +115,8 @@ func (r *schedulerRegistry) upsert(def CronJobScheduler, version int64, entryID 
 	}
 
 	rec.kind = JobKindRepeat
+	rec.taskName = def.Name
+	rec.jobID = CronJobID(def.Name, def.Cron)
 	rec.cron = def.Cron
 	rec.version = version
 	rec.allowParallel = def.AllowParallel

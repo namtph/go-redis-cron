@@ -134,6 +134,7 @@ func (s *Scheduler) handleRun(parent context.Context, task internal.RunTask) {
 
 	rec, ok := s.registry.get(task.Name)
 	if !ok || rec.stopped {
+		s.log.Error("unknown job for claimed run", "job", task.Name)
 		s.registry.markRun(task.Name, RunStatusSkipped, nil)
 		ack()
 		return
@@ -142,6 +143,15 @@ func (s *Scheduler) handleRun(parent context.Context, task internal.RunTask) {
 		s.registry.markRun(task.Name, RunStatusSkipped, nil)
 		ack()
 		return
+	}
+
+	taskName := task.TaskName
+	if taskName == "" {
+		taskName = rec.taskName
+	}
+	args := task.Args
+	if args == nil {
+		args = rec.args
 	}
 
 	releaseActive := func() {}
@@ -165,7 +175,18 @@ func (s *Scheduler) handleRun(parent context.Context, task internal.RunTask) {
 	runCtx, runCancel := context.WithTimeout(parent, rec.timeout)
 	rec.setRunCancel(runCancel)
 
-	runErr := rec.fn(runCtx)
+	var runErr error
+	if fn, ok := s.tasks.get(taskName); ok {
+		runErr = fn(runCtx, args...)
+	} else if rec.fn != nil {
+		runErr = rec.fn(runCtx)
+	} else {
+		s.log.Error("unknown task for claimed run", "task", taskName, "job", task.Name)
+		s.metrics.IncUnknownTask()
+		s.registry.markRun(task.Name, RunStatusSkipped, nil)
+		ack()
+		return
+	}
 	runCancel()
 	rec.clearRunCancel()
 	releaseActive()

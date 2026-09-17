@@ -11,15 +11,18 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// RunTask is enqueued when a cron schedule fires on the leader.
+// RunTask is enqueued when a cron schedule fires on the leader (no func payload).
 type RunTask struct {
 	Name        string `json:"name"`
+	TaskName    string `json:"taskName"`
 	Version     int64  `json:"version"`
 	ScheduledAt int64  `json:"scheduledAt"` // UnixMilli
+	Args        []any  `json:"args,omitempty"`
 }
 
 // RunQueue manages pending/processing runs in Redis.
 type RunQueue struct {
+	claimConn *redis.Conn
 	rdb       redis.UniversalClient
 	namespace string
 	pending   string
@@ -31,8 +34,9 @@ type RunQueue struct {
 	onOOM     func()
 }
 
-func NewRunQueue(rdb redis.UniversalClient, namespace string, onOOM func()) *RunQueue {
+func NewRunQueue(claimConn *redis.Conn, rdb redis.UniversalClient, namespace string, onOOM func()) *RunQueue {
 	return &RunQueue{
+		claimConn:  claimConn,
 		rdb:        rdb,
 		namespace:  namespace,
 		pending:    RunQueueKey(namespace),
@@ -81,7 +85,11 @@ redis.call('HSET', meta, raw, worker .. '|' .. tostring(deadlineMs))
 redis.call('ZADD', leases, deadlineMs, raw)
 return raw
 `)
-	raw, err := script.Run(ctx, q.rdb, []string{q.pending, q.processing, q.meta, q.leases},
+	var claimer redis.Scripter = q.rdb
+	if q.claimConn != nil {
+		claimer = q.claimConn
+	}
+	raw, err := script.Run(ctx, claimer, []string{q.pending, q.processing, q.meta, q.leases},
 		workerID, q.claimTTL.Milliseconds()).Text()
 	if errors.Is(err, redis.Nil) || raw == "" {
 		return RunTask{}, false, nil
