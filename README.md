@@ -60,11 +60,20 @@ func main() {
 		log.Fatal(err)
 	}
 
-	err = sched.AddFunc("hourly-report", "Hourly report", "0 * * * *", func(ctx context.Context) error {
-		log.Println("hourly job ran once cluster-wide")
-		return nil
+	err = sched.Register(gorediscron.CronJobScheduler{
+		Name:          "hourly-report",
+		Cron:          "0 * * * *",
+		AllowParallel: false,
+		Fn: func(ctx context.Context) error {
+			log.Println("hourly job ran once cluster-wide")
+			return nil
+		},
 	})
 	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := sched.StartWorkers(2); err != nil {
 		log.Fatal(err)
 	}
 
