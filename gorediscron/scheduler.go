@@ -14,11 +14,13 @@ import (
 
 // Scheduler coordinates cron ticks (leader), run queueing, and worker execution.
 type Scheduler struct {
-	cfg    Config
-	rdb    redis.UniversalClient
-	log    Logger
-	leader *internal.Leader
-	queue  *internal.RunQueue
+	cfg     Config
+	rdb     redis.UniversalClient
+	log     Logger
+	metrics Metrics
+	leader  *internal.Leader
+	queue   *internal.RunQueue
+	local   *internal.LocalQueue
 
 	cron     *cron.Cron
 	registry *schedulerRegistry
@@ -27,16 +29,17 @@ type Scheduler struct {
 	runCancel context.CancelFunc
 	leaderWG  sync.WaitGroup
 	workerWG  sync.WaitGroup
+	claimWG   sync.WaitGroup
 
-	workerMu         sync.Mutex
-	workersStarted   bool
-	workerCount      int
+	workerMu       sync.Mutex
+	workersStarted bool
+	workerCount    int
 
 	started atomic.Bool
 	mu      sync.Mutex
 }
 
-// New builds a scheduler. Register schedulers, StartWorkers, then Start.
+// New builds a scheduler. Register schedulers, StartWorkers, then Start or StartWith.
 func New(rdb redis.UniversalClient, cfg Config) (*Scheduler, error) {
 	if rdb == nil {
 		return nil, errors.New("gorediscron: redis client is required")
@@ -44,55 +47,23 @@ func New(rdb redis.UniversalClient, cfg Config) (*Scheduler, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	return &Scheduler{
+	m := metricsOrNop(cfg.Metrics)
+	s := &Scheduler{
 		cfg:      cfg,
 		rdb:      rdb,
 		log:      loggerOrNop(cfg.Logger),
+		metrics:  m,
 		leader:   internal.NewLeader(rdb, cfg.Namespace, cfg.InstanceID, cfg.LeaseTTL),
-		queue:    internal.NewRunQueue(rdb, cfg.Namespace),
 		registry: newSchedulerRegistry(),
-	}, nil
+	}
+	s.queue = internal.NewRunQueue(rdb, cfg.Namespace, m.IncRedisOOM)
+	s.local = internal.NewLocalQueue(cfg.queueCapacity(), m.SetLocalQueueDepth)
+	return s, nil
 }
 
 // Jobs returns a snapshot of registered schedulers for APIs and the UI.
 func (s *Scheduler) Jobs() []Job {
 	return s.registry.snapshot(s.leader.IsLeader())
-}
-
-// Start begins leader election, cron scheduling, and worker goroutines.
-func (s *Scheduler) Start(ctx context.Context) error {
-	if !s.started.CompareAndSwap(false, true) {
-		return errors.New("gorediscron: already started")
-	}
-	if !s.workersStarted {
-		return errNoWorkers
-	}
-	if s.registry.len() == 0 {
-		return errNoSchedules
-	}
-
-	runCtx, cancel := context.WithCancel(ctx)
-	s.runCtx = runCtx
-	s.runCancel = cancel
-
-	s.leaderWG.Add(1)
-	go func() {
-		defer s.leaderWG.Done()
-		if err := s.leader.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
-			s.log.Error("leader loop stopped", "err", err)
-		}
-	}()
-
-	s.ensureCron().Start()
-
-	s.workerWG.Add(1)
-	go func() {
-		defer s.workerWG.Done()
-		s.runWorkers(runCtx)
-	}()
-
-	s.log.Info("scheduler started", "namespace", s.cfg.Namespace, "instance", s.cfg.InstanceID, "workers", s.workerCount)
-	return nil
 }
 
 // Stop shuts down workers, cron, and leader election.
@@ -124,6 +95,7 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 		s.leader.Stop()
 		s.leaderWG.Wait()
 		s.workerWG.Wait()
+		s.claimWG.Wait()
 		close(done)
 	}()
 

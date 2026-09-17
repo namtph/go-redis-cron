@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/namtph/go-redis-cron/gorediscron/internal"
+	"github.com/redis/go-redis/v9"
 	"github.com/robfig/cron/v3"
 )
 
@@ -97,6 +98,9 @@ func (s *Scheduler) bindCron(name, spec string) (cron.EntryID, error) {
 			ctx = context.Background()
 		}
 		if err := s.queue.Enqueue(ctx, task); err != nil {
+			if internal.IsRedisOOM(err) {
+				s.metrics.IncRedisOOM()
+			}
 			s.log.Error("enqueue run failed", "name", name, "err", err)
 			return
 		}
@@ -110,16 +114,43 @@ func (s *Scheduler) bindCron(name, spec string) (cron.EntryID, error) {
 func (s *Scheduler) persistMeta(ctx context.Context, name, cronExpr string, version int64, allowParallel, stopped bool) error {
 	key := internal.SchedMetaKey(s.cfg.Namespace, name)
 	if stopped {
-		return s.rdb.HSet(ctx, key, map[string]interface{}{
+		err := s.rdb.HSet(ctx, key, map[string]interface{}{
 			"stopped": "1",
 		}).Err()
+		if internal.IsRedisOOM(err) {
+			s.metrics.IncRedisOOM()
+		}
+		return err
 	}
-	return s.rdb.HSet(ctx, key, map[string]interface{}{
-		"cron":           cronExpr,
-		"version":        version,
-		"allow_parallel": boolToInt(allowParallel),
-		"stopped":        "0",
-	}).Err()
+	script := redis.NewScript(`
+local key = KEYS[1]
+local newVer = tonumber(ARGV[1])
+local cron = ARGV[2]
+local parallel = ARGV[3]
+local cur = redis.call('HGET', key, 'version')
+if cur then
+  cur = tonumber(cur)
+  if cur > newVer then
+    return 0
+  end
+end
+redis.call('HSET', key, 'version', newVer, 'cron', cron, 'allow_parallel', parallel, 'stopped', '0')
+return 1
+`)
+	res, err := script.Run(ctx, s.rdb, []string{key}, version, cronExpr, boolToInt(allowParallel)).Int64()
+	if internal.IsRedisOOM(err) {
+		s.metrics.IncRedisOOM()
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if res == 0 {
+		s.metrics.IncRegisterSkipped()
+	} else {
+		s.metrics.IncRegisterApplied()
+	}
+	return nil
 }
 
 func boolToInt(v bool) int {
