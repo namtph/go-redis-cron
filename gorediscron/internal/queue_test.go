@@ -12,7 +12,7 @@ import (
 func TestRunClaimDedup(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	q := NewRunQueue(rdb, "ns")
+	q := NewRunQueue(rdb, "ns", nil)
 
 	ctx := context.Background()
 	at := time.Now().UnixMilli()
