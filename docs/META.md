@@ -1,126 +1,200 @@
-# Distributed job runtime — meta (sections 1–4)
+# Distributed cron runtime — design contract (v2)
 
-This document is the product contract for `gorediscron`. API mapping:
+This document is the target behavior for a **from-scratch** implementation. The current `gorediscron` code is a stepping stone; new work should converge here.
 
-| META | gorediscron |
-|------|-------------|
-| `registerJobs` | `Register(CronJobScheduler)` — **anytime**, repeatable |
-| `startWorkerPool` | `StartWorkerPool(ctx, WorkerPoolConfig{NumberOfWorkerInstances: n})` |
-| `startLeader` (claim loop) | Started inside `StartWorkerPool` |
-| Cron tick enqueue | `StartCron` + leader; optional `StartLeaderElection` |
+## 0. Three decoupled concerns
 
-**Library, not a framework:** no required order. Examples: register-only; worker pool then register; register many times after workers are running.
+All three share one **Redis prefix** (`Config.Prefix` / namespace). Call order is **not** enforced.
 
-## 1. Pod topology (homogeneous or split)
+| Concern | API (target) | Where state lives |
+|---------|----------------|-------------------|
+| **Tasks** | `RegisterTask(name, fn)` | In-process only (`fn(ctx, args...)` cannot be serialized) |
+| **Jobs** | `RegisterJob(...)` (cron only for now) | Redis metadata + in-process cron binding on scheduler pods |
+| **Workers** | `StartWorkerPool(ctx, cfg)` | In-process pool + **one claim loop per pod** |
 
-**Intent:** The library does not require a single deployment shape. It supports both “every pod does everything” and deliberate split roles.
+Errors are raised only when something **runs**, not when something **registers**:
 
-| Mode | Typical use |
-|------|-------------|
-| **Full pod** | Register jobs, run worker pool, run in-pod leader (Redis → local queue). |
-| **Scheduler pod** | Register jobs only (or register + optional light workers if you enable them). |
-| **Worker pod** | Worker pool + in-pod leader; skip job registration (or no-op register). |
+- `RegisterTask` / `RegisterJob` / `StartWorkerPool` return errors for invalid input or Redis failures.
+- When a worker executes a claimed run: if the **task** is not registered on **this pod**, log an error (and metrics), then **ack** the run (do not spin forever). Typical causes: split deployment forgot `RegisterTask`, or job version/hash drift.
 
-**Rules:**
-
-- No special pod type is required at the framework level—only **configuration** (which steps you start).
-- **Job registration is idempotent** keyed by stable job id (and optionally schedule/version). Any number of pods may call register on startup; duplicates converge to one definition in Redis.
-- Registration must not delete or overwrite a newer definition from another pod without an explicit version/compare rule (document your idempotency key semantics in the register API).
-
-**Non-goals:** The library does not assign “scheduler” vs “worker” labels in Redis; the operator chooses which processes call `register`, `startWorkers`, and `startLeader`.
-
-Use `StartWith(ctx, SchedulerPodMode())`, `WorkerPodMode()`, or `FullStartMode()`.
+Scheduler pods enqueue **run records** into Redis; worker pods pull and execute using **local** task handlers.
 
 ---
 
-## 2. Startup (register and worker pool)
+## 1. Tasks
 
-**Intent:** Ordering is **allowed and documented**, not **enforced**. Users of the library control startup per pod role.
+```go
+type TaskFunc func(ctx context.Context, args ...any) error
 
-### Recommended full pod
-
-```text
-1. registerJobs(ctx)     // idempotent; retry/backoff on Redis errors
-2. startWorkerPool(ctx)  // local queue + workers exist before leader enqueues
-3. startLeader(ctx)      // Redis claim → local queue
+func (r *Runtime) RegisterTask(taskName string, fn TaskFunc) error
 ```
 
-### Split pods
-
-| Pod kind | Start |
-|----------|--------|
-| Scheduler | `registerJobs` (required for that deployment); worker pool / leader optional. |
-| Worker | `startWorkerPool` then `startLeader`; omit `registerJobs` or use a no-op. |
-
-**Library behavior:**
-
-- Expose independent lifecycle hooks; do not assume all three run in one process.
-- **Multi-register:** Safe when every registering pod uses the same idempotent register API (see §1).
-- If a worker pod starts before any scheduler has registered jobs, workers simply idle until job metadata exists—no crash requirement.
-
-**Not guaranteed:** Global “register completed everywhere before any worker runs” ordering across the cluster (operator responsibility for split deployments).
+- `taskName` is unique per process (duplicate → error or replace — pick **error** for safety).
+- `args` are copied from job definition and/or tick payload (JSON in Redis queue).
+- Tasks are **never** stored in Redis.
 
 ---
 
-## 3. In-pod leader and local queue
+## 2. Jobs (cron only)
 
-**Intent:** Work moves **Redis → local queue → worker goroutines** inside each worker-capable pod.
+```go
+type CronJob struct {
+    Name     string   // unique job id within Prefix (operator-chosen)
+    TaskName string   // must match a RegisterTask name on executors
+    Cron     string   // 5- or 6-field expression
+    Args     []any    // optional frozen args passed to TaskFunc
+}
 
-- Exactly one **claimer loop per pod** (the “worker leader”) should perform Redis claims and enqueue locally, unless you explicitly document a different concurrency model.
-- Workers consume only from the local queue (or equivalent in-process buffer), not directly from Redis.
-- Claims must use **atomic Redis semantics** (single script or command sequence with clear ownership/lease).
-- If a pod dies after claim but before successful processing, **lease / visibility timeout** must eventually return work to the claimable set in Redis (standard at-least-once execution).
-
-**Split topology:** Scheduler-only pods do not run a leader or worker pool unless configured to.
-
----
-
-## 4. Backpressure and failure domains (local queue vs Redis)
-
-**Intent:** Local queue fullness must not silently lose tasks. Redis capacity exhaustion is an **accepted** loss domain.
-
-### Recommended pattern (implement this)
-
-Use **reserve-then-claim** to avoid TOCTOU between “queue has room” and “claim succeeded”:
-
-```text
-1. Try acquire local slot (semaphore / bounded channel reservation).
-2. If no slot: do not claim; backoff (leader idle or short sleep).
-3. If slot acquired: atomic claim in Redis.
-4. If claim fails: release slot; retry/backoff.
-5. If claim succeeds: enqueue locally; on enqueue failure, NACK/requeue in Redis and release slot.
-6. Worker completes job → ack/release lease in Redis (per your execution model).
+func (r *Runtime) RegisterJob(job CronJob) error
 ```
 
-### Local queue full (all worker pods)
+### Job definition hash
 
-| Situation | Required behavior |
-|-----------|-------------------|
-| This pod’s queue full | Do not claim (preferred) or claim then **requeue** to Redis; never keep a task only in memory without Redis backing. |
-| All pods’ queues full | Tasks **remain in Redis** (backlog grows); leaders backoff. No task loss due to local saturation alone. |
+Deterministic id for “is this the same definition?”:
 
-### Redis RAM / memory full (explicit exception)
+```text
+jobID = "job_cronjob_" + sanitize(taskName) + "_" + sanitize(cron)
+```
 
-When Redis rejects writes or evicts data because **Redis itself is out of memory**:
+- `sanitize(s)`: lowercase, `[a-z0-9_]` only, collapse `_`, max length 64 (hash suffix if longer).
+- Stored at Redis: `{prefix}:job:def:{job.Name}` → `{ jobID, taskName, cron, args, version }`.
 
-- The library **may lose jobs** (register, enqueue, requeue, or ack paths may fail irrecoverably).
-- Required observability: `Metrics.IncRedisOOM()` and error logs on OOM paths.
+### Idempotent re-register
 
-**Summary:**
+| Case | Behavior |
+|------|----------|
+| Same `job.Name`, computed `jobID` unchanged | **No-op** (no version bump, no cron reschedule) |
+| Same `job.Name`, `jobID` changed (cron or task changed) | **Overwrite** metadata, bump `version`, reschedule cron on this process |
+| New `job.Name` | Insert |
 
-| Failure | Task loss |
-|---------|-----------|
-| Local queue full (any/all pods) | **Not allowed** (backoff + requeue / no-claim). |
-| Pod crash after claim | **Not allowed** (lease → reclaim). |
-| Redis OOM / RAM full | **Allowed** (best-effort; no durability guarantee). |
+`job.Name` is the **unique key** operators use; `jobID` detects definition equality.
 
 ---
 
-## Implementation checklist (gorediscron)
+## 3. Worker pool (same prefix)
 
-- [x] Idempotent `Register` with version-guarded Redis metadata.
-- [x] `StartWorkerPool` / `StartWith` / cron leader enqueue (split roles).
-- [x] `internal.LocalQueue` + claim loop reserve-then-claim.
-- [x] Redis pending/processing + lease ZSET + `ReclaimExpired`.
-- [x] Requeue on active-lock contention and claim-loop failures.
-- [x] `Metrics` interface (claims, requeues, acks, OOM, queue depth).
+```go
+func (r *Runtime) StartWorkerPool(ctx context.Context, cfg WorkerPoolConfig) error
+```
+
+- `WorkerPoolConfig.NumberOfWorkers` ≥ 1.
+- Uses the same `Prefix` as `RegisterJob` so enqueue and claim see one queue.
+- **One Redis connection per pod** drives claiming: a dedicated `Conn` (or single goroutine owning one connection) runs the claim loop. Other goroutines use the shared client only for ack/active locks if needed, but **must not** compete on the blocking claim path.
+
+### Claim → execute flow
+
+```text
+claim loop (1 conn, 1 goroutine per pod)
+  → reserve local worker slot (semaphore)
+  → if no slot: do NOT touch Redis pending (backoff)
+  → if slot: atomic claim one run from Redis FIFO pending
+  → dispatch to local bounded queue
+worker goroutines
+  → resolve job metadata (name/version)
+  → lookup TaskName in local task registry
+  → if missing: log error + metric; ack (skip)
+  → else: fn(ctx, args...)
+  → ack / release processing lease
+```
+
+---
+
+## 4. FIFO queue and the “busy pod” problem
+
+**Problem:** Runs sit in Redis. Pod A has all workers busy; Pod B has free workers. Work must not stick behind Pod A’s in-memory backlog while B is idle.
+
+**Solution: global FIFO in Redis + reserve-then-claim**
+
+```text
+                    ┌─────────────────────────────────────┐
+  cron leader       │  Redis LIST pending (FIFO)          │
+  RPUSH / LPUSH ──► │  [run1][run2][run3]...              │
+                    └──────────────┬──────────────────────┘
+                                   │
+         ┌─────────────────────────┼─────────────────────────┐
+         ▼                         ▼                         ▼
+    Pod A claim loop           Pod B claim loop         Pod C ...
+    (only if slot free)        (only if slot free)
+         │                         │
+         ▼                         ▼
+    local queue (bounded)      local queue
+         │                         │
+    worker goroutines          worker goroutines
+```
+
+Rules:
+
+1. **Pending queue is only in Redis** (LIST or Stream with consumer groups). Enqueue is FIFO (e.g. `LPUSH` + claim from tail via `RPOPLPUSH`, or `XADD` + `XREADGROUP`).
+2. **A pod claims only when it has a free local worker slot** (reserve-then-claim). If all workers are busy, the claim loop **does not** pull from Redis.
+3. Therefore a run stays in the **shared** pending list until **some** pod with capacity claims it — not pinned to a busy pod.
+4. After claim, move payload to a **processing** structure with a **lease TTL**. If the pod dies mid-run, reaper returns the run to pending (at-least-once).
+5. Local queue is a **small buffer** (≈ worker count), not a second backlog. If local enqueue fails after claim, **requeue to Redis** and release the slot.
+
+| Failure | Task loss? |
+|---------|------------|
+| Local workers all busy | No — waits in Redis |
+| Pod crash after claim | No — lease → reclaim |
+| Redis OOM | Yes (best-effort; metric + log) |
+
+This is the same pattern as §4 in the previous META (reserve-then-claim); v2 makes the **task/job split** and **jobID** rules explicit.
+
+---
+
+## 5. Cron leader (enqueue only)
+
+Only the Redis **cron leader** (lease per prefix) evaluates schedules and enqueues runs:
+
+```text
+{prefix}:leader  SET NX PX
+```
+
+On tick: `Enqueue(Run{ JobName, Version, ScheduledAt, Args })` — no `Fn` in payload.
+
+Non-leader pods do not enqueue. They may still run workers.
+
+---
+
+## 6. Unknown task / version mismatch
+
+When handling a claimed run:
+
+| Condition | Action |
+|-----------|--------|
+| Job metadata missing in Redis | Log error; ack (poison) or short retry — prefer **ack + metric** after N tries |
+| `version` < registered version on pod | Log; mark skipped; ack |
+| Task not in local registry | **Log error** (“unknown task … for job …”); ack |
+| Task panics / returns error | Log; ack; optional retry policy later |
+
+No fatal error in `Register*` paths for “worker not ready yet”.
+
+---
+
+## 7. Target public surface
+
+```go
+type Runtime struct { ... }
+
+func New(rdb redis.UniversalClient, cfg Config) (*Runtime, error)
+
+func (r *Runtime) RegisterTask(name string, fn TaskFunc) error
+func (r *Runtime) RegisterJob(job CronJob) error
+
+func (r *Runtime) StartWorkerPool(ctx context.Context, cfg WorkerPoolConfig) error
+func (r *Runtime) StartCronLeader(ctx context.Context) error // election + cron engine
+
+func (r *Runtime) Stop(ctx context.Context) error
+```
+
+Legacy `Scheduler` APIs may wrap this during migration.
+
+---
+
+## 8. Implementation checklist (v2)
+
+- [ ] `RegisterTask` registry (in-process)
+- [ ] `RegisterJob` + `jobID` hash + Redis metadata (noop vs overwrite)
+- [ ] Cron leader + enqueue run JSON (no fn)
+- [ ] Worker pool + **single claim connection** per pod
+- [ ] Reserve-then-claim + Redis FIFO pending/processing + lease reaper
+- [ ] Unknown-task path (log + ack)
+- [ ] Metrics: claim, ack, skip, unknown_task, requeue, redis_oom

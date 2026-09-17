@@ -49,20 +49,23 @@ No Gin/Echo in the library; examples use `net/http` only.
 5. Update `README.md` and `examples/README.md` when public API or example flags change.
 6. Do not commit secrets, `.env` files, or local Redis dumps.
 
-## Public API (scheduler)
+## Public API (target v2 — see docs/META.md)
+
+Decoupled: **tasks**, **jobs** (cron), **worker pool**; shared Redis prefix.
 
 ```go
-func New(rdb redis.UniversalClient, cfg Config) (*Scheduler, error)
-func (s *Scheduler) Register(def CronJobScheduler) error
-func (s *Scheduler) StartLeaderElection(ctx context.Context) error
-func (s *Scheduler) StartCron(ctx context.Context) error
-func (s *Scheduler) StartWorkerPool(ctx context.Context, cfg WorkerPoolConfig) error
-func (s *Scheduler) Start(ctx context.Context) error
-func (s *Scheduler) StartWith(ctx context.Context, mode StartMode) error
-func (s *Scheduler) Stop(ctx context.Context) error
-func (s *Scheduler) Jobs() []Job
+func New(rdb redis.UniversalClient, cfg Config) (*Runtime, error)
+
+func (r *Runtime) RegisterTask(name string, fn TaskFunc) error
+func (r *Runtime) RegisterJob(job CronJob) error
+
+func (r *Runtime) StartWorkerPool(ctx context.Context, cfg WorkerPoolConfig) error
+func (r *Runtime) StartCronLeader(ctx context.Context) error
+func (r *Runtime) Stop(ctx context.Context) error
 ```
 
-`WorkerPoolConfig` holds `NumberOfWorkerInstances` (required ≥ 1 when starting the pool).
+Job definition id: `CronJobID(taskName, cron)` — same id → noop re-register; different id for same `job.Name` → overwrite.
+
+Legacy `Scheduler` APIs remain until migration completes.
 
 See [docs/META.md](docs/META.md).
