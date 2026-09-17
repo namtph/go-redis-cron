@@ -6,32 +6,37 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/namtph/go-redis-cron/gorediscron/internal"
 	"github.com/redis/go-redis/v9"
 	"github.com/robfig/cron/v3"
 )
 
-// Scheduler runs cron jobs when this instance is the Redis-elected leader.
+// Scheduler coordinates cron ticks (leader), run queueing, and worker execution.
 type Scheduler struct {
 	cfg    Config
 	rdb    redis.UniversalClient
 	log    Logger
 	leader *internal.Leader
+	queue  *internal.RunQueue
 
-	cron   *cron.Cron
-	registry *jobRegistry
+	cron     *cron.Cron
+	registry *schedulerRegistry
 
-	runCtx context.Context
+	runCtx    context.Context
 	runCancel context.CancelFunc
-	leaderWG sync.WaitGroup
+	leaderWG  sync.WaitGroup
+	workerWG  sync.WaitGroup
+
+	workerMu         sync.Mutex
+	workersStarted   bool
+	workerCount      int
 
 	started atomic.Bool
 	mu      sync.Mutex
 }
 
-// New builds a scheduler. Call AddFunc before Start.
+// New builds a scheduler. Register schedulers, StartWorkers, then Start.
 func New(rdb redis.UniversalClient, cfg Config) (*Scheduler, error) {
 	if rdb == nil {
 		return nil, errors.New("gorediscron: redis client is required")
@@ -44,64 +49,26 @@ func New(rdb redis.UniversalClient, cfg Config) (*Scheduler, error) {
 		rdb:      rdb,
 		log:      loggerOrNop(cfg.Logger),
 		leader:   internal.NewLeader(rdb, cfg.Namespace, cfg.InstanceID, cfg.LeaseTTL),
-		registry: newJobRegistry(),
+		queue:    internal.NewRunQueue(rdb, cfg.Namespace),
+		registry: newSchedulerRegistry(),
 	}, nil
 }
 
-// AddFunc registers a cron job. Only the leader executes fn on schedule.
-func (s *Scheduler) AddFunc(id, name, spec string, fn JobFunc) error {
-	if s.started.Load() {
-		return errors.New("gorediscron: cannot add job after Start")
-	}
-	if id == "" {
-		return errors.New("gorediscron: job id is required")
-	}
-	if fn == nil {
-		return errors.New("gorediscron: job func is required")
-	}
-	sched, err := parseSpec(spec)
-	if err != nil {
-		return err
-	}
-
-	wrapped := func() {
-		if !s.leader.IsLeader() {
-			s.registry.markSkipped(id)
-			return
-		}
-		ctx := s.runCtx
-		if ctx == nil {
-			ctx = context.Background()
-		}
-		runErr := fn(ctx)
-		s.registry.markRun(id, runErr)
-		if runErr != nil {
-			s.log.Error("job failed", "id", id, "err", runErr)
-		}
-	}
-
-	entryID, err := s.ensureCron().AddFunc(spec, wrapped)
-	if err != nil {
-		return err
-	}
-
-	next := sched.Next(time.Now())
-	s.registry.add(id, name, spec, entryID, next)
-	return nil
-}
-
-// Jobs returns a snapshot of registered jobs for APIs and the UI.
+// Jobs returns a snapshot of registered schedulers for APIs and the UI.
 func (s *Scheduler) Jobs() []Job {
 	return s.registry.snapshot(s.leader.IsLeader())
 }
 
-// Start begins leader election and the cron runner.
+// Start begins leader election, cron scheduling, and worker goroutines.
 func (s *Scheduler) Start(ctx context.Context) error {
 	if !s.started.CompareAndSwap(false, true) {
 		return errors.New("gorediscron: already started")
 	}
+	if !s.workersStarted {
+		return errNoWorkers
+	}
 	if s.registry.len() == 0 {
-		return errors.New("gorediscron: no jobs registered")
+		return errNoSchedules
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -117,11 +84,18 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	}()
 
 	s.ensureCron().Start()
-	s.log.Info("scheduler started", "namespace", s.cfg.Namespace, "instance", s.cfg.InstanceID)
+
+	s.workerWG.Add(1)
+	go func() {
+		defer s.workerWG.Done()
+		s.runWorkers(runCtx)
+	}()
+
+	s.log.Info("scheduler started", "namespace", s.cfg.Namespace, "instance", s.cfg.InstanceID, "workers", s.workerCount)
 	return nil
 }
 
-// Stop shuts down cron, releases leadership, and waits for the leader loop.
+// Stop shuts down workers, cron, and leader election.
 func (s *Scheduler) Stop(ctx context.Context) error {
 	if !s.started.Load() {
 		return nil
@@ -136,17 +110,20 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 		stopCtx = context.Background()
 	}
 
-	cronStop := s.ensureCron().Stop()
-	select {
-	case <-cronStop.Done():
-	case <-stopCtx.Done():
-		return stopCtx.Err()
+	if s.cron != nil {
+		cronStop := s.cron.Stop()
+		select {
+		case <-cronStop.Done():
+		case <-stopCtx.Done():
+			return stopCtx.Err()
+		}
 	}
 
 	done := make(chan struct{})
 	go func() {
 		s.leader.Stop()
 		s.leaderWG.Wait()
+		s.workerWG.Wait()
 		close(done)
 	}()
 

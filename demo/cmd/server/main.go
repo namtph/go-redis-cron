@@ -47,10 +47,18 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := sched.AddFunc("heartbeat", "Heartbeat", "*/10 * * * * *", func(ctx context.Context) error {
-		log.Printf("[%s] heartbeat job", *instanceID)
-		return nil
+	if err := sched.Register(gorediscron.CronJobScheduler{
+		Name: "heartbeat",
+		Cron: "*/10 * * * * *",
+		Fn: func(ctx context.Context) error {
+			log.Printf("[%s] heartbeat job", *instanceID)
+			return nil
+		},
 	}); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := sched.StartWorkers(2); err != nil {
 		log.Fatal(err)
 	}
 
