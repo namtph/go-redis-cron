@@ -2,99 +2,101 @@
 
 ## Project purpose
 
-Small Go library: run cron schedules safely across multiple pods using Redis leader election. Every replica may start the scheduler; only the elected leader executes job callbacks.
+Go monorepo with three deliverables:
 
-**Non-goals:** distributed task queue, delayed jobs, workflow orchestration, HTTP workers. Keep the API minimal.
+1. **`gorediscron`** — distributed cron scheduler (Redis leader election + in-process cron).
+2. **`ui`** — embedded static job dashboard + JSON API; optional mounts for Gin, Echo, and gorilla/mux.
+3. **`demo`** — runnable server and Docker Compose Redis for manual and integration testing.
+
+**Non-goals:** general-purpose task queue, delayed jobs, workflow engine, separate worker processes.
+
+## Repository layout
+
+```
+gorediscron/          # import: github.com/namtph/go-redis-cron/gorediscron
+  scheduler.go        # public Scheduler API
+  registry.go         # in-memory job state for UI
+  internal/           # leader election, Redis keys
+ui/
+  handler.go          # embed static + stdlib mux
+  api.go              # GET /api/jobs
+  static/             # index.html, app.js, app.css
+  gin/ echo/ mux/     # framework mount helpers (optional deps)
+demo/
+  docker-compose.yml  # Redis 7
+  cmd/server/         # flags: -framework, -instance, -redis, -ui-prefix
+```
 
 ## Architecture
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Pod A     │     │   Pod B     │     │   Pod C     │
-│  Scheduler  │     │  Scheduler  │     │  Scheduler  │
-│  + cron     │     │  + cron     │     │  + cron     │
-└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
-       │                   │                   │
-       └───────────────────┼───────────────────┘
-                           ▼
-                    ┌─────────────┐
-                    │    Redis    │
-                    │ leader lock │
-                    │  (SET NX)   │
-                    └─────────────┘
+┌─────────────┐     ┌─────────────┐
+│  Pod A      │     │  Pod B      │
+│ Scheduler   │     │ Scheduler   │
+│ + ui mount  │     │ + ui mount  │
+└──────┬──────┘     └──────┬──────┘
+       └──────────┬────────┘
+                  ▼
+           ┌─────────────┐
+           │    Redis    │
+           │ leader lock │
+           └─────────────┘
 ```
 
-### Core components (target layout)
+Every pod may expose the UI (read-only job snapshot). Only the leader executes `JobFunc` callbacks.
 
-| Package / file | Responsibility |
-|----------------|----------------|
-| `scheduler.go` | Public `Scheduler`, `Config`, `New`, `AddFunc`, `Start`, `Stop` |
-| `leader.go` | Acquire, renew, release lease; `OnPromoted` / `OnDemoted` hooks |
-| `keys.go` | Namespaced Redis key helpers (`{namespace}:leader`, etc.) |
-| `doc.go` | Package documentation for `go doc` |
+### Leader election
 
-### Leader election rules
+- Acquire: `SET {ns}:leader instanceID NX PX ttl`
+- Renew / release via Lua comparing `instanceID`
+- Renewal interval ≈ `LeaseTTL / 3`
+- Cluster: hash tag `{namespace}` on all keys touched in one script
 
-- Acquire with `SET key instanceID NX PX <ttl>`.
-- Renew only when value matches `InstanceID` (Lua or `GET` + conditional `PEXPIRE`).
-- Renewal interval ≈ `LeaseTTL / 3`.
-- On demotion: stop cron ticks immediately; do not run callbacks.
-- On `Stop`: cancel context, release lease if leader, wait for in-flight job (with timeout).
+### UI contract
 
-### Redis Cluster
-
-Keys touched in one atomic script must share a hash tag: `{namespace}:leader`, `{namespace}:fence`, etc.
+- `ui.JobSource` → `Jobs() []gorediscron.Job`
+- `*gorediscron.Scheduler` implements `JobSource`
+- Default prefix `/cron` (static + `api/jobs` relative to prefix)
 
 ## Dependencies
 
-- `github.com/redis/go-redis/v9` — Redis client
-- `github.com/robfig/cron/v3` — cron parsing and scheduling
-- `github.com/alicebob/miniredis/v2` — unit/integration tests (test only)
-
-Avoid heavy frameworks. Prefer stdlib + small, well-known libraries.
+| Module | Use |
+|--------|-----|
+| `github.com/redis/go-redis/v9` | Redis client |
+| `github.com/robfig/cron/v3` | Cron parsing |
+| `github.com/alicebob/miniredis/v2` | Tests |
+| gin / echo / mux | Demo + `ui/*` mounts only |
 
 ## Coding conventions
 
-- Go 1.22+. Use `context.Context` on public APIs (`Start`, `Stop`, job callbacks).
-- Job signature: `func(ctx context.Context) error`.
-- Export only what users need; keep leader logic internal or in `internal/`.
-- Table-driven tests; cover leader failover, duplicate `Start`, and graceful `Stop`.
-- No inline imports. Exhaustive switches on enums/unions with `default: var _ T = x; panic("unhandled")` or equivalent.
-- Errors: wrap with `%w`; return typed errors only when callers need to branch.
+- Go 1.22+, `context.Context` on `Start`, `Stop`, and job callbacks
+- `JobFunc func(ctx context.Context) error`
+- Register jobs with stable `id`, display `name`, and cron `spec`
+- Table-driven tests; miniredis for leader tests
+- No inline imports; exhaustive switches on enums/unions
+- Keep framework adapters thin — delegate to `ui.Handler`
 
 ## Testing checklist
 
-- [ ] Single instance acquires lease and runs job on schedule
-- [ ] Second instance does not run jobs while first holds lease
-- [ ] Lease expiry promotes standby within `LeaseTTL + renewal slack`
-- [ ] `Stop` on leader allows follower to take over
-- [ ] Duplicate `InstanceID` is rejected or documented as unsafe
-- [ ] Namespace isolates keys between deployments
+- [x] Leader: single winner among two instances (miniredis)
+- [x] UI: `/api/jobs` returns registered jobs
+- [ ] Scheduler: job runs only when leader
+- [ ] Scheduler: failover promotes standby
+- [ ] Demo: two instances, one leader in UI
 
 ## Agent workflow
 
-1. Read existing code before adding types or dependencies.
-2. Prefer focused diffs; do not scaffold unrelated tooling unless asked.
-3. Run `go test ./...` and `go vet ./...` before finishing.
-4. Update README examples when the public API changes.
-5. Do not commit secrets, `.env` files, or local Redis dumps.
+1. Identify which area changed (scheduler / ui / demo) and keep diffs scoped.
+2. Run `go test ./...` and `go vet ./...` from repo root.
+3. Update `README.md` when public API or demo flags change.
+4. Do not commit secrets or local Redis dumps.
 
-## Public API sketch (stable target)
+## Public API (scheduler)
 
 ```go
-type Config struct {
-    Namespace  string
-    InstanceID string
-    LeaseTTL   time.Duration
-    Logger     Logger // optional
-}
-
 func New(rdb redis.UniversalClient, cfg Config) (*Scheduler, error)
-func (s *Scheduler) AddFunc(spec string, fn JobFunc) error
+func (s *Scheduler) AddFunc(id, name, spec string, fn JobFunc) error
+func (s *Scheduler) Jobs() []Job
 func (s *Scheduler) Start(ctx context.Context) error
 func (s *Scheduler) Stop(ctx context.Context) error
-
-type JobFunc func(ctx context.Context) error
 ```
-
-Adjust names to match implementation, but keep this shape unless the user requests otherwise.
