@@ -1,111 +1,64 @@
 # go-redis-cron
 
-A small Go library for running cron schedules across multiple pods with Redis-backed leader election, plus an optional embedded job dashboard.
+A small Go library for running cron schedules across multiple pods with Redis-backed leader election, a Redis run queue, in-pod backpressure, and an optional embedded job dashboard.
+
+Design contract: [docs/META.md](docs/META.md).
 
 ## Repository layout
 
 | Area | Path | Description |
 |------|------|-------------|
-| **Scheduler** | [`gorediscron/`](gorediscron/) | Core library: Redis leader election + cron execution |
+| **Scheduler** | [`gorediscron/`](gorediscron/) | Core library: leader election, cron ticks, claim loop, workers |
 | **Job UI** | [`ui/`](ui/) | Embedded static dashboard and JSON API (`net/http.Handler`) |
-| **Demo** | [`demo/`](demo/) | Local Redis + sample HTTP server to test multi-instance behavior |
-
-## Problem
-
-When you run the same service in multiple replicas, a plain in-process cron scheduler fires on every pod. That duplicates work, wastes resources, and can corrupt shared state.
-
-`go-redis-cron` coordinates replicas through Redis so exactly one pod runs scheduled jobs at a time, with automatic failover when the leader stops renewing its lease.
+| **Demo** | [`demo/`](demo/) | Local Redis + sample HTTP server |
 
 ## Features
 
 - Cron schedules via [robfig/cron](https://github.com/robfig/cron) (5- or 6-field expressions)
-- Redis leader election with lease renewal (`SET NX` + TTL heartbeat)
-- Safe to call `Start()` on every pod; non-leaders skip job execution
-- Built-in static job viewer (`GET /cron/` by default), served as `http.Handler`
+- Redis leader election; **only the leader enqueues** cron ticks to Redis
+- **Worker pool on every pod**: in-pod claim loop (reserve → Redis claim → local queue) + executors
+- Idempotent `Register` with version-guarded metadata in Redis
+- Split deployments via `StartWith` (scheduler-only vs worker-only pods)
+- **No enforced startup order** between `Register` and worker/cron/leader hooks
+- Optional `Metrics` hook (claims, requeues, OOM, local queue depth)
 
-## Requirements
+## Scheduler API (library — no required order)
 
-- Go 1.22+
-- Redis 6+ (standalone, Sentinel, or Cluster with hash-tagged keys)
-
-## Installation
-
-```bash
-go get github.com/namtph/go-redis-cron/gorediscron
-```
-
-## Scheduler quick start
-
-```go
-package main
-
-import (
-	"context"
-	"log"
-	"time"
-
-	"github.com/namtph/go-redis-cron/gorediscron"
-	"github.com/redis/go-redis/v9"
-)
-
-func main() {
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-
-	sched, err := gorediscron.New(rdb, gorediscron.Config{
-		Namespace:  "billing",
-		InstanceID: "billing-pod-abc123",
-		LeaseTTL:   10 * time.Second,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = sched.AddFunc("hourly-report", "Hourly report", "0 * * * *", func(ctx context.Context) error {
-		log.Println("hourly job ran once cluster-wide")
-		return nil
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	if err := sched.Start(context.Background()); err != nil {
-		log.Fatal(err)
-	}
-	defer sched.Stop(context.Background())
-}
-```
-
-## Job UI
-
-The `ui` package embeds a small static site and `GET …/api/jobs` JSON. Pass any `JobSource` (the scheduler implements `Jobs()`).
-
-Mount `ui.Handler` on your HTTP server (stdlib, Gin, Echo, chi, etc. all accept `http.Handler`):
+| Call | Purpose |
+|------|---------|
+| `Register` | Idempotent job + Redis metadata; anytime, repeat as needed |
+| `StartLeaderElection(ctx)` | Redis leader loop |
+| `StartCron(ctx)` | Cron engine (empty until you `Register`) |
+| `StartWorkerPool(ctx, WorkerPoolConfig{NumberOfWorkerInstances: n})` | Claim loop + workers + reaper |
+| `StartWith(ctx, mode)` | Optional convenience bundle |
+| `Start(ctx)` | Leader election + cron only (not worker pool) |
 
 ```go
-mux := http.NewServeMux()
-mux.Handle("/", ui.Handler(sched, ui.Options{Prefix: "/cron"}))
-http.ListenAndServe(":8080", mux)
+pool := gorediscron.WorkerPoolConfig{NumberOfWorkerInstances: 2}
+
+_ = sched.StartWorkerPool(ctx, pool)
+_ = sched.Register(gorediscron.CronJobScheduler{...})
+
+_ = sched.StartLeaderElection(ctx)
+_ = sched.StartCron(ctx)
 ```
 
-With Gin: `r.Any("/cron/*path", gin.WrapH(ui.Handler(sched, uiOpts)))`.
+## Split pods
 
-See [`demo/cmd/server`](demo/cmd/server/main.go) for a minimal `net/http` example.
+```go
+_ = sched.Register(...)
+_ = sched.StartWith(ctx, gorediscron.SchedulerPodMode())
 
-## Demo
-
-```bash
-make redis
-go run ./demo/cmd/server -instance demo-1 -addr :8080
+_ = sched.StartWith(ctx, gorediscron.WorkerPodMode(gorediscron.WorkerPoolConfig{NumberOfWorkerInstances: 4}))
 ```
-
-Open http://localhost:8080/cron/ — details in [`demo/README.md`](demo/README.md).
 
 ## How it works
 
-1. Each pod tries to acquire a namespaced leader key in Redis.
-2. The leader renews the lease on an interval shorter than `LeaseTTL`.
-3. Only the leader runs cron callbacks; followers mark runs as skipped.
-4. On demotion or shutdown, the pod stops holding the lease so another pod can take over.
+1. Each pod may participate in leader election (scheduler pods).
+2. The **cron leader** enqueues `RunTask` JSON into Redis pending.
+3. On each worker-capable pod, one **claim loop** reserves a local slot, atomically claims from Redis, and enqueues locally.
+4. Worker goroutines run `Fn` from the **local queue** only.
+5. Processing leases are reclaimed after TTL if a pod dies mid-claim.
 
 ## Development
 

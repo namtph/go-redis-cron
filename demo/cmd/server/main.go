@@ -47,9 +47,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := sched.AddFunc("heartbeat", "Heartbeat", "*/10 * * * * *", func(ctx context.Context) error {
-		log.Printf("[%s] heartbeat job", *instanceID)
-		return nil
+	if err := sched.Register(gorediscron.CronJobScheduler{
+		Name: "heartbeat",
+		Cron: "*/10 * * * * *",
+		Fn: func(ctx context.Context) error {
+			log.Printf("[%s] heartbeat job", *instanceID)
+			return nil
+		},
 	}); err != nil {
 		log.Fatal(err)
 	}
@@ -57,7 +61,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := sched.Start(ctx); err != nil {
+	if err := sched.StartWorkerPool(ctx, gorediscron.WorkerPoolConfig{NumberOfWorkerInstances: 2}); err != nil {
+		log.Fatal(err)
+	}
+	if err := sched.StartLeaderElection(ctx); err != nil {
+		log.Fatal(err)
+	}
+	if err := sched.StartCron(ctx); err != nil {
 		log.Fatal(err)
 	}
 	defer func() {

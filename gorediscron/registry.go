@@ -1,97 +1,168 @@
 package gorediscron
 
 import (
+	"context"
 	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
 )
 
-type jobRecord struct {
-	id       string
-	name     string
-	spec     string
-	entryID  cron.EntryID
-	nextRun  time.Time
-	lastRun  time.Time
-	lastErr  string
-	status   RunStatus
+type schedRecord struct {
+	kind          JobKind
+	name          string
+	cron          string
+	version       int64
+	allowParallel bool
+	timeout       time.Duration
+	stopped       bool
+	fn            JobFunc
+	entryID       cron.EntryID
+	nextRun       time.Time
+	lastRun       time.Time
+	lastErr       string
+	lastStatus    RunStatus
+
+	runMu     sync.Mutex
+	runCancel context.CancelFunc
 }
 
-type jobRegistry struct {
-	mu    sync.RWMutex
-	byID  map[string]*jobRecord
-	order []string
+func (rec *schedRecord) cancelInFlight() {
+	rec.runMu.Lock()
+	defer rec.runMu.Unlock()
+	if rec.runCancel != nil {
+		rec.runCancel()
+		rec.runCancel = nil
+	}
 }
 
-func newJobRegistry() *jobRegistry {
-	return &jobRegistry{byID: make(map[string]*jobRecord)}
+func (rec *schedRecord) setRunCancel(cancel context.CancelFunc) {
+	rec.runMu.Lock()
+	defer rec.runMu.Unlock()
+	rec.runCancel = cancel
 }
 
-func (r *jobRegistry) len() int {
+func (rec *schedRecord) clearRunCancel() {
+	rec.runMu.Lock()
+	defer rec.runMu.Unlock()
+	rec.runCancel = nil
+}
+
+type schedulerRegistry struct {
+	mu     sync.RWMutex
+	byName map[string]*schedRecord
+	order  []string
+}
+
+func newSchedulerRegistry() *schedulerRegistry {
+	return &schedulerRegistry{byName: make(map[string]*schedRecord)}
+}
+
+func (r *schedulerRegistry) len() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return len(r.byID)
+	return len(r.byName)
 }
 
-func (r *jobRegistry) add(id, name, spec string, entryID cron.EntryID, next time.Time) {
+func (r *schedulerRegistry) get(name string) (*schedRecord, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.byName[name]
+	return rec, ok
+}
+
+func (r *schedulerRegistry) upsert(def CronJobScheduler, version int64, entryID cron.EntryID, next time.Time) *schedRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, exists := r.byID[id]; !exists {
-		r.order = append(r.order, id)
+
+	rec, exists := r.byName[def.Name]
+	if exists {
+		rec.cancelInFlight()
+	} else {
+		rec = &schedRecord{name: def.Name}
+		r.byName[def.Name] = rec
+		r.order = append(r.order, def.Name)
 	}
-	r.byID[id] = &jobRecord{
-		id:      id,
-		name:    name,
-		spec:    spec,
-		entryID: entryID,
-		nextRun: next,
-		status:  RunStatusUnknown,
+
+	rec.kind = JobKindRepeat
+	rec.cron = def.Cron
+	rec.version = version
+	rec.allowParallel = def.AllowParallel
+	rec.timeout = def.runTimeout()
+	rec.stopped = false
+	rec.fn = def.Fn
+	rec.entryID = entryID
+	rec.nextRun = next
+	return rec
+}
+
+func (r *schedulerRegistry) stop(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byName[name]
+	if !ok {
+		return false
+	}
+	rec.stopped = true
+	rec.cancelInFlight()
+	return true
+}
+
+func (r *schedulerRegistry) removeEntryID(name string) cron.EntryID {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byName[name]
+	if !ok {
+		return 0
+	}
+	id := rec.entryID
+	rec.entryID = 0
+	return id
+}
+
+func (r *schedulerRegistry) setNextRun(name string, next time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if rec, ok := r.byName[name]; ok {
+		rec.nextRun = next
 	}
 }
 
-func (r *jobRegistry) markRun(id string, err error) {
+func (r *schedulerRegistry) markRun(name string, status RunStatus, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	rec, ok := r.byID[id]
+	rec, ok := r.byName[name]
 	if !ok {
 		return
 	}
 	rec.lastRun = time.Now()
+	rec.lastStatus = status
 	if err != nil {
 		rec.lastErr = err.Error()
-		rec.status = RunStatusFailed
 	} else {
 		rec.lastErr = ""
-		rec.status = RunStatusSuccess
 	}
 }
 
-func (r *jobRegistry) markSkipped(id string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	rec, ok := r.byID[id]
-	if !ok {
-		return
-	}
-	rec.status = RunStatusSkipped
-}
-
-func (r *jobRegistry) snapshot(isLeader bool) []Job {
+func (r *schedulerRegistry) snapshot(isLeader bool) []Job {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]Job, 0, len(r.order))
-	for _, id := range r.order {
-		rec := r.byID[id]
+	for _, name := range r.order {
+		rec := r.byName[name]
 		out = append(out, Job{
-			ID:         rec.id,
-			Name:       rec.name,
-			Spec:       rec.spec,
-			NextRun:    rec.nextRun,
-			LastRun:    rec.lastRun,
-			LastError:  rec.lastErr,
-			LastStatus: rec.status,
-			LeaderRun:  isLeader,
+			ID:            rec.name,
+			Name:          rec.name,
+			Kind:          rec.kind,
+			Spec:          rec.cron,
+			Version:       rec.version,
+			AllowParallel: rec.allowParallel,
+			Stopped:       rec.stopped,
+			NextRun:       rec.nextRun,
+			LastRun:       rec.lastRun,
+			LastError:     rec.lastErr,
+			LastStatus:    rec.lastStatus,
+			LeaderRun:     isLeader,
 		})
 	}
 	return out
