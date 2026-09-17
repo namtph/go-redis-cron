@@ -60,7 +60,7 @@ func (r *Runtime) RegisterTask(name string, fn TaskFunc) error
 func (r *Runtime) RegisterJob(job CronJob) error
 
 func (r *Runtime) StartWorkerPool(ctx context.Context, cfg WorkerPoolConfig) error
-func (r *Runtime) StartCronLeader(ctx context.Context) error
+func (r *Runtime) JoinLeader(ctx context.Context) error
 func (r *Runtime) Stop(ctx context.Context) error
 ```
 

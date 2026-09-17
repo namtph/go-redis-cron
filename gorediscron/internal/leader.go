@@ -20,10 +20,12 @@ type Leader struct {
 
 	mu      sync.RWMutex
 	leader  bool
-	stopCh   chan struct{}
-	doneCh   chan struct{}
-	started  bool
-	stopOnce sync.Once
+	stopCh     chan struct{}
+	doneCh     chan struct{}
+	started    bool
+	stopOnce   sync.Once
+	onPromoted func()
+	onDemoted  func()
 }
 
 // NewLeader creates a leader elector. Call Run to participate in election.
@@ -41,6 +43,15 @@ func NewLeader(rdb redis.UniversalClient, namespace, instanceID string, leaseTTL
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
 	}
+}
+
+// SetCallbacks runs onPromoted when this instance wins the lease and onDemoted when it loses it.
+// Set before Run; callbacks must be non-blocking.
+func (l *Leader) SetCallbacks(onPromoted, onDemoted func()) {
+	l.mu.Lock()
+	l.onPromoted = onPromoted
+	l.onDemoted = onDemoted
+	l.mu.Unlock()
 }
 
 // IsLeader reports whether this instance currently holds the lease.
@@ -157,6 +168,16 @@ func (l *Leader) release(ctx context.Context) error {
 
 func (l *Leader) setLeader(v bool) {
 	l.mu.Lock()
+	was := l.leader
 	l.leader = v
+	promoted := l.onPromoted
+	demoted := l.onDemoted
 	l.mu.Unlock()
+
+	if !was && v && promoted != nil {
+		promoted()
+	}
+	if was && !v && demoted != nil {
+		demoted()
+	}
 }

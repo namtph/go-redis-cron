@@ -5,28 +5,17 @@ import (
 	"errors"
 )
 
-// StartLeaderElection runs the Redis leader loop. Idempotent. Does not require Register.
+// StartLeaderElection is deprecated; use JoinLeader, which also runs cron only while leader.
 func (s *Scheduler) StartLeaderElection(ctx context.Context) error {
+	return s.JoinLeader(ctx)
+}
+
+// StartCron starts the in-process cron on every pod and gates enqueue with IsLeader().
+// Prefer JoinLeader for homogeneous deployments (cron runs only on the elected leader).
+func (s *Scheduler) StartCron(ctx context.Context) error {
 	if s.leaderStarted.Load() {
 		return nil
 	}
-	runCtx := s.ensureRunCtx(ctx)
-	if !s.leaderStarted.CompareAndSwap(false, true) {
-		return nil
-	}
-	s.leaderWG.Add(1)
-	go func() {
-		defer s.leaderWG.Done()
-		if err := s.leader.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
-			s.log.Error("leader loop stopped", "err", err)
-		}
-	}()
-	return nil
-}
-
-// StartCron starts the in-process cron scheduler. Idempotent. Does not require Register first;
-// jobs added later via Register are picked up (if cron is already running, entries attach immediately).
-func (s *Scheduler) StartCron(ctx context.Context) error {
 	_ = s.ensureRunCtx(ctx)
 	if s.cronStarted.Load() {
 		return nil

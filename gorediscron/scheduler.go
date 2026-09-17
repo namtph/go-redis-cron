@@ -40,7 +40,7 @@ type Scheduler struct {
 	mu sync.Mutex
 }
 
-// New builds a scheduler. Call Register, StartCron, StartWorkerPool, etc. in any order you need.
+// New builds a scheduler. Call Register, JoinLeader, StartWorkerPool, etc. in any order you need.
 func New(rdb redis.UniversalClient, cfg Config) (*Scheduler, error) {
 	if rdb == nil {
 		return nil, errors.New("gorediscron: redis client is required")

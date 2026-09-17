@@ -144,6 +144,45 @@ func (r *schedulerRegistry) markRun(name string, status RunStatus, err error) {
 	}
 }
 
+func (r *schedulerRegistry) setEntryID(name string, id cron.EntryID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if rec, ok := r.byName[name]; ok {
+		rec.entryID = id
+	}
+}
+
+func (r *schedulerRegistry) clearCronEntryIDs() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, rec := range r.byName {
+		rec.entryID = 0
+	}
+}
+
+func (r *schedulerRegistry) activeCronJobs() []struct {
+	name string
+	cron string
+} {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []struct {
+		name string
+		cron string
+	}
+	for _, name := range r.order {
+		rec := r.byName[name]
+		if rec.stopped {
+			continue
+		}
+		out = append(out, struct {
+			name string
+			cron string
+		}{name: rec.name, cron: rec.cron})
+	}
+	return out
+}
+
 func (r *schedulerRegistry) snapshot(isLeader bool) []Job {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

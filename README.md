@@ -27,20 +27,18 @@ Design contract: [docs/META.md](docs/META.md).
 | Call | Purpose |
 |------|---------|
 | `Register` | Idempotent job + Redis metadata; anytime, repeat as needed |
-| `StartLeaderElection(ctx)` | Redis leader loop |
-| `StartCron(ctx)` | Cron engine (empty until you `Register`) |
+| `JoinLeader(ctx)` | One goroutine: leader race; **cron runs only while leader** |
 | `StartWorkerPool(ctx, WorkerPoolConfig{NumberOfWorkerInstances: n})` | Claim loop + workers + reaper |
 | `StartWith(ctx, mode)` | Optional convenience bundle |
-| `Start(ctx)` | Leader election + cron only (not worker pool) |
+| `Start(ctx)` | Same as `JoinLeader` (not worker pool) |
+| `StartCron(ctx)` | Legacy: cron on every pod with `IsLeader` gate; prefer `JoinLeader` |
 
 ```go
 pool := gorediscron.WorkerPoolConfig{NumberOfWorkerInstances: 2}
 
 _ = sched.StartWorkerPool(ctx, pool)
 _ = sched.Register(gorediscron.CronJobScheduler{...})
-
-_ = sched.StartLeaderElection(ctx)
-_ = sched.StartCron(ctx)
+_ = sched.JoinLeader(ctx)
 ```
 
 ## Split pods

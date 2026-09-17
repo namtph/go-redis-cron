@@ -23,24 +23,27 @@ func WorkerPodMode(cfg WorkerPoolConfig) StartMode {
 	return StartMode{LeaderElection: false, Cron: false, Workers: true, WorkerPool: cfg}
 }
 
-// Start runs leader election and cron. It does not start the worker pool; call StartWorkerPool separately.
+// Start joins the leader race and runs cron only while leader. Does not start the worker pool.
 func (s *Scheduler) Start(ctx context.Context) error {
-	if err := s.StartLeaderElection(ctx); err != nil {
-		return err
-	}
-	return s.StartCron(ctx)
+	return s.JoinLeader(ctx)
 }
 
 // StartWith enables selected loops. Each piece is independent; Register is never required beforehand.
 func (s *Scheduler) StartWith(ctx context.Context, mode StartMode) error {
-	if mode.LeaderElection {
-		if err := s.StartLeaderElection(ctx); err != nil {
+	if mode.LeaderElection && mode.Cron {
+		if err := s.JoinLeader(ctx); err != nil {
 			return err
 		}
-	}
-	if mode.Cron {
-		if err := s.StartCron(ctx); err != nil {
-			return err
+	} else {
+		if mode.LeaderElection {
+			if err := s.startLeaderOnly(ctx); err != nil {
+				return err
+			}
+		}
+		if mode.Cron {
+			if err := s.StartCron(ctx); err != nil {
+				return err
+			}
 		}
 	}
 	if mode.Workers {
