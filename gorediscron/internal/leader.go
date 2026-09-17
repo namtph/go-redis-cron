@@ -11,6 +11,11 @@ import (
 )
 
 // Leader coordinates Redis-based leader election for one scheduler namespace.
+//
+// Leadership stickiness: once a pod wins, it remains leader for as long as the process
+// keeps renewing the lease (LeaseTTL/3). Another pod becomes leader only after the
+// current holder stops renewing—typically Stop(), graceful shutdown, process crash,
+// or restart (lease TTL expiry). Transient Redis errors do not voluntarily step down.
 type Leader struct {
 	rdb        redis.UniversalClient
 	key        string
@@ -110,9 +115,11 @@ func (l *Leader) tick(ctx context.Context) error {
 	if l.IsLeader() {
 		ok, err := l.renew(ctx)
 		if err != nil {
-			return err
+			// Keep trying; do not demote on transient Redis errors.
+			return nil
 		}
 		if !ok {
+			// Key held by another instance or lease expired without renewal.
 			l.setLeader(false)
 		}
 		return nil
@@ -120,7 +127,8 @@ func (l *Leader) tick(ctx context.Context) error {
 
 	ok, err := l.acquire(ctx)
 	if err != nil {
-		return err
+		// Follower: retry on next round.
+		return nil
 	}
 	l.setLeader(ok)
 	return nil

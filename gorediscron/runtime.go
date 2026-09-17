@@ -2,7 +2,6 @@ package gorediscron
 
 import (
 	"context"
-	"errors"
 )
 
 // StartLeaderElection is deprecated; use JoinLeader, which also runs cron only while leader.

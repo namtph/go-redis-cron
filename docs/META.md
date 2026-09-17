@@ -152,6 +152,20 @@ On tick: `Enqueue(Run{ JobName, Version, ScheduledAt, Args })` — no `Fn` in pa
 
 Non-leader pods do not enqueue. They may still run workers.
 
+### Leadership stickiness (`JoinLeader`)
+
+Once a pod **wins** the race, it is leader **continuously** while the process runs: the loop renews the lease every `LeaseTTL/3` and runs cron until demotion.
+
+Another pod becomes leader **only** when the current holder stops renewing, for example:
+
+- `Stop()` / graceful shutdown (explicit `DEL` of the leader key)
+- Process **crash** or **restart** (no renewal → key expires after `LeaseTTL`)
+- Rare: Redis key overwritten because `InstanceID` collided or manual ops
+
+**Not** valid reasons to step down: transient Redis errors (retry renewal), follower pods calling `SET NX`, or re-registering jobs. Followers keep sleeping between rounds until the key is free.
+
+Homogeneous pods all call `JoinLeader`; exactly one winner enqueues at a time.
+
 ---
 
 ## 6. Unknown task / version mismatch

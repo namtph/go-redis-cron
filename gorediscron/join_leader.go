@@ -8,8 +8,9 @@ import (
 )
 
 // JoinLeader starts one background goroutine that competes for the Redis leader lease.
-// On win it runs leader work: in-process cron (enqueue ticks to Redis). On loss it stops cron
-// and sleeps until the next election round (LeaseTTL/3). Idempotent.
+// On win it runs leader work: in-process cron (enqueue ticks to Redis) and keeps renewing
+// until Stop, shutdown, crash, or restart—another pod takes over only after the lease expires.
+// On loss it stops cron and sleeps until the next election round (LeaseTTL/3). Idempotent.
 func (s *Scheduler) JoinLeader(ctx context.Context) error {
 	if s.leaderStarted.Load() {
 		return nil

@@ -69,3 +69,7 @@ Job definition id: `CronJobID(taskName, cron)` — same id → noop re-register;
 Legacy `Scheduler` APIs remain until migration completes.
 
 See [docs/META.md](docs/META.md).
+
+## Leader election (remember)
+
+`JoinLeader`: one goroutine per pod. **Winner stays leader** until `Stop`, crash, or restart stops lease renewal—then another pod wins on the next round. Do not demote on transient Redis errors; renew until the key is lost or released.
