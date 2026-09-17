@@ -73,11 +73,12 @@ Avoid heavy frameworks. Prefer stdlib + small, well-known libraries.
 
 ## Agent workflow
 
-1. Read existing code before adding types or dependencies.
-2. Prefer focused diffs; do not scaffold unrelated tooling unless asked.
-3. Run `go test ./...` and `go vet ./...` before finishing.
-4. Update README examples when the public API changes.
-5. Do not commit secrets, `.env` files, or local Redis dumps.
+1. **Default branch:** At the start of every task, run `git checkout dev` and `git pull origin dev`, unless the user or task gives different branch instructions.
+2. Read existing code before adding types or dependencies.
+3. Prefer focused diffs; do not scaffold unrelated tooling unless asked.
+4. Run `go test ./...` and `go vet ./...` before finishing.
+5. Update README examples when the public API changes.
+6. Do not commit secrets, `.env` files, or local Redis dumps.
 
 ## Public API sketch (stable target)
 
