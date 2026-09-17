@@ -10,8 +10,9 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
-// Register adds or updates a repeat cron scheduler by Name.
-// Re-registering the same Name gracefully cancels an in-flight run, replaces cron/func options, and bumps Version.
+// Register adds or updates a repeat cron scheduler by Name (idempotent Redis metadata).
+// Safe to call before or after StartCron / StartWorkerPool, and any number of times.
+// Re-registering the same Name cancels an in-flight run, replaces cron/func options, and bumps Version.
 func (s *Scheduler) Register(def CronJobScheduler) error {
 	if err := def.validate(); err != nil {
 		return err

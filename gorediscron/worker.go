@@ -11,22 +11,6 @@ import (
 
 const reaperInterval = 5 * time.Second
 
-// StartWorkers configures how many goroutines execute runs from the local queue.
-// Call before StartWith Workers mode.
-func (s *Scheduler) StartWorkers(n int) error {
-	if n < 1 {
-		return errors.New("gorediscron: worker count must be at least 1")
-	}
-	s.workerMu.Lock()
-	defer s.workerMu.Unlock()
-	if s.workersStarted {
-		return errors.New("gorediscron: workers already started")
-	}
-	s.workerCount = n
-	s.workersStarted = true
-	return nil
-}
-
 func (s *Scheduler) runWorkers(ctx context.Context) {
 	s.workerMu.Lock()
 	n := s.workerCount

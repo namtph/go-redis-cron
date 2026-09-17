@@ -31,15 +31,17 @@ type Scheduler struct {
 	workerWG  sync.WaitGroup
 	claimWG   sync.WaitGroup
 
-	workerMu       sync.Mutex
-	workersStarted bool
-	workerCount    int
+	workerMu         sync.Mutex
+	workerCount      int
+	workerCountSet   bool
+	workerPoolStarted atomic.Bool
+	leaderStarted    atomic.Bool
+	cronStarted      atomic.Bool
 
-	started atomic.Bool
-	mu      sync.Mutex
+	mu sync.Mutex
 }
 
-// New builds a scheduler. Register schedulers, StartWorkers, then Start or StartWith.
+// New builds a scheduler. Call Register, StartCron, StartWorkerPool, etc. in any order you need.
 func New(rdb redis.UniversalClient, cfg Config) (*Scheduler, error) {
 	if rdb == nil {
 		return nil, errors.New("gorediscron: redis client is required")
@@ -66,15 +68,15 @@ func (s *Scheduler) Jobs() []Job {
 	return s.registry.snapshot(s.leader.IsLeader())
 }
 
-// Stop shuts down workers, cron, and leader election.
+// Stop shuts down running loops started via Start* methods.
 func (s *Scheduler) Stop(ctx context.Context) error {
-	if !s.started.Load() {
+	s.mu.Lock()
+	cancel := s.runCancel
+	s.mu.Unlock()
+	if cancel == nil {
 		return nil
 	}
-
-	if s.runCancel != nil {
-		s.runCancel()
-	}
+	cancel()
 
 	stopCtx := ctx
 	if stopCtx == nil {
@@ -105,7 +107,13 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 		return stopCtx.Err()
 	}
 
-	s.started.Store(false)
+	s.leaderStarted.Store(false)
+	s.cronStarted.Store(false)
+	s.workerPoolStarted.Store(false)
+	s.mu.Lock()
+	s.runCtx = nil
+	s.runCancel = nil
+	s.mu.Unlock()
 	s.log.Info("scheduler stopped", "instance", s.cfg.InstanceID)
 	return nil
 }
