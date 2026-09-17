@@ -43,15 +43,16 @@ No Gin/Echo in the library; examples use `net/http` only.
 ## Agent workflow
 
 1. **Default branch:** At the start of every task, run `git checkout dev` and `git pull origin dev`, unless the user or task gives different branch instructions.
-2. Read existing code before adding types or dependencies.
-3. Prefer focused diffs; keep scheduler / ui / examples scoped.
-4. Run `go test ./...` and `go vet ./...` before finishing.
-5. Update `README.md` and `examples/README.md` when public API or example flags change.
-6. Do not commit secrets, `.env` files, or local Redis dumps.
+2. **No direct pushes to `dev`:** Create a branch `cursor/<short-description>-eb22`, commit there, push the branch, and open a **pull request into `dev`** for the user to merge. Do not `git push origin dev` unless the user explicitly asks.
+3. Read existing code before adding types or dependencies.
+4. Prefer focused diffs; keep scheduler / ui / examples scoped.
+5. Run `go test ./...` and `go vet ./...` before finishing.
+6. Update `README.md` and `examples/README.md` when public API or example flags change.
+7. Do not commit secrets, `.env` files, or local Redis dumps.
 
-## Public API (target v2 — see docs/META.md)
+## Public API (v2 — see docs/META.md)
 
-Decoupled: **tasks**, **jobs** (cron), **worker pool**; shared Redis prefix.
+`Runtime` / `Scheduler` (alias). Decoupled **tasks**, **jobs**, **worker pool**; shared Redis prefix.
 
 ```go
 func New(rdb redis.UniversalClient, cfg Config) (*Runtime, error)
@@ -59,14 +60,12 @@ func New(rdb redis.UniversalClient, cfg Config) (*Runtime, error)
 func (r *Runtime) RegisterTask(name string, fn TaskFunc) error
 func (r *Runtime) RegisterJob(job CronJob) error
 
-func (r *Runtime) StartWorkerPool(ctx context.Context, cfg WorkerPoolConfig) error
 func (r *Runtime) JoinLeader(ctx context.Context) error
+func (r *Runtime) StartWorkerPool(ctx context.Context, cfg WorkerPoolConfig) error
 func (r *Runtime) Stop(ctx context.Context) error
 ```
 
-Job definition id: `CronJobID(taskName, cron)` — same id → noop re-register; different id for same `job.Name` → overwrite.
-
-Legacy `Scheduler` APIs remain until migration completes.
+Job definition id: `CronJobID(taskName, cron)` — same id → noop; different id for same `job.Name` → overwrite + version bump.
 
 See [docs/META.md](docs/META.md).
 
