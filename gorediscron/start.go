@@ -7,18 +7,20 @@ type StartMode struct {
 	LeaderElection bool
 	Cron           bool
 	Workers        bool
+	// WorkerPool is required when Workers is true.
+	WorkerPool WorkerPoolConfig
 }
 
-func FullStartMode() StartMode {
-	return StartMode{LeaderElection: true, Cron: true, Workers: true}
+func FullStartMode(workers WorkerPoolConfig) StartMode {
+	return StartMode{LeaderElection: true, Cron: true, Workers: true, WorkerPool: workers}
 }
 
 func SchedulerPodMode() StartMode {
 	return StartMode{LeaderElection: true, Cron: true, Workers: false}
 }
 
-func WorkerPodMode() StartMode {
-	return StartMode{LeaderElection: false, Cron: false, Workers: true}
+func WorkerPodMode(cfg WorkerPoolConfig) StartMode {
+	return StartMode{LeaderElection: false, Cron: false, Workers: true, WorkerPool: cfg}
 }
 
 // Start runs leader election and cron. It does not start the worker pool; call StartWorkerPool separately.
@@ -42,7 +44,7 @@ func (s *Scheduler) StartWith(ctx context.Context, mode StartMode) error {
 		}
 	}
 	if mode.Workers {
-		if err := s.StartWorkerPool(ctx); err != nil {
+		if err := s.StartWorkerPool(ctx, mode.WorkerPool); err != nil {
 			return err
 		}
 	}

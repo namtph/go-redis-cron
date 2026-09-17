@@ -58,14 +58,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := sched.SetWorkerCount(2); err != nil {
-		log.Fatal(err)
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := sched.StartWorkerPool(ctx); err != nil {
+	if err := sched.StartWorkerPool(ctx, gorediscron.WorkerPoolConfig{NumberOfWorkerInstances: 2}); err != nil {
 		log.Fatal(err)
 	}
 	if err := sched.StartLeaderElection(ctx); err != nil {

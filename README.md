@@ -24,43 +24,32 @@ Design contract: [docs/META.md](docs/META.md).
 
 ## Scheduler API (library — no required order)
 
-Each call is independent. Typical pieces:
-
 | Call | Purpose |
 |------|---------|
 | `Register` | Idempotent job + Redis metadata; anytime, repeat as needed |
-| `SetWorkerCount(n)` | Configure worker goroutines (does not start them) |
 | `StartLeaderElection(ctx)` | Redis leader loop |
 | `StartCron(ctx)` | Cron engine (empty until you `Register`) |
-| `StartWorkerPool(ctx)` | Claim loop + workers + reaper (default 1 worker if count unset) |
+| `StartWorkerPool(ctx, WorkerPoolConfig{NumberOfWorkerInstances: n})` | Claim loop + workers + reaper |
 | `StartWith(ctx, mode)` | Optional convenience bundle |
 | `Start(ctx)` | Leader election + cron only (not worker pool) |
 
 ```go
-// Any order, e.g. workers first, register later:
-_ = sched.StartWorkerPool(ctx)
-_ = sched.Register(gorediscron.CronJobScheduler{...})
-_ = sched.Register(gorediscron.CronJobScheduler{...}) // again later
+pool := gorediscron.WorkerPoolConfig{NumberOfWorkerInstances: 2}
 
-// Or register only (persist metadata, no goroutines):
+_ = sched.StartWorkerPool(ctx, pool)
 _ = sched.Register(gorediscron.CronJobScheduler{...})
 
-// Full pod example:
-_ = sched.SetWorkerCount(2)
-_ = sched.StartWorkerPool(ctx)
 _ = sched.StartLeaderElection(ctx)
 _ = sched.StartCron(ctx)
-_ = sched.Register(gorediscron.CronJobScheduler{Name: "hourly-report", Cron: "0 * * * *", Fn: fn})
 ```
 
 ## Split pods
 
 ```go
-_ = sched.Register(...) // as needed
-_ = sched.StartWith(ctx, gorediscron.SchedulerPodMode()) // election + cron, no workers
+_ = sched.Register(...)
+_ = sched.StartWith(ctx, gorediscron.SchedulerPodMode())
 
-_ = sched.SetWorkerCount(4)
-_ = sched.StartWith(ctx, gorediscron.WorkerPodMode()) // workers only
+_ = sched.StartWith(ctx, gorediscron.WorkerPodMode(gorediscron.WorkerPoolConfig{NumberOfWorkerInstances: 4}))
 ```
 
 ## How it works
@@ -68,7 +57,7 @@ _ = sched.StartWith(ctx, gorediscron.WorkerPodMode()) // workers only
 1. Each pod may participate in leader election (scheduler pods).
 2. The **cron leader** enqueues `RunTask` JSON into Redis pending.
 3. On each worker-capable pod, one **claim loop** reserves a local slot, atomically claims from Redis, and enqueues locally.
-4. Worker goroutines run `Fn` from the **local queue** only; skips requeue to Redis when appropriate (META §4).
+4. Worker goroutines run `Fn` from the **local queue** only.
 5. Processing leases are reclaimed after TTL if a pod dies mid-claim.
 
 ## Development

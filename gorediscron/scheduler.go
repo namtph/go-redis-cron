@@ -31,10 +31,9 @@ type Scheduler struct {
 	workerWG  sync.WaitGroup
 	claimWG   sync.WaitGroup
 
-	workerMu         sync.Mutex
-	workerCount      int
-	workerCountSet   bool
-	workerPoolStarted atomic.Bool
+	workerMu            sync.Mutex
+	workerCount         int
+	workerPoolStarted   atomic.Bool
 	leaderStarted    atomic.Bool
 	cronStarted      atomic.Bool
 

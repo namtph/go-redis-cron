@@ -5,28 +5,6 @@ import (
 	"errors"
 )
 
-// SetWorkerCount sets how many goroutines StartWorkerPool will run.
-// Safe before the worker pool is started; may be called multiple times until then.
-// Does not start any goroutines.
-func (s *Scheduler) SetWorkerCount(n int) error {
-	if n < 1 {
-		return errors.New("gorediscron: worker count must be at least 1")
-	}
-	if s.workerPoolStarted.Load() {
-		return errors.New("gorediscron: worker pool already running")
-	}
-	s.workerMu.Lock()
-	defer s.workerMu.Unlock()
-	s.workerCount = n
-	s.workerCountSet = true
-	return nil
-}
-
-// StartWorkers is an alias for SetWorkerCount (count only, does not start goroutines).
-func (s *Scheduler) StartWorkers(n int) error {
-	return s.SetWorkerCount(n)
-}
-
 // StartLeaderElection runs the Redis leader loop. Idempotent. Does not require Register.
 func (s *Scheduler) StartLeaderElection(ctx context.Context) error {
 	if s.leaderStarted.Load() {
@@ -61,8 +39,11 @@ func (s *Scheduler) StartCron(ctx context.Context) error {
 }
 
 // StartWorkerPool starts the Redis claim loop, lease reaper, and worker goroutines.
-// Idempotent. Does not require Register. Uses SetWorkerCount value, or 1 if unset.
-func (s *Scheduler) StartWorkerPool(ctx context.Context) error {
+// Idempotent. Does not require Register.
+func (s *Scheduler) StartWorkerPool(ctx context.Context, cfg WorkerPoolConfig) error {
+	if err := cfg.validate(); err != nil {
+		return err
+	}
 	if s.workerPoolStarted.Load() {
 		return nil
 	}
@@ -70,11 +51,8 @@ func (s *Scheduler) StartWorkerPool(ctx context.Context) error {
 	if !s.workerPoolStarted.CompareAndSwap(false, true) {
 		return nil
 	}
+	n := cfg.NumberOfWorkerInstances
 	s.workerMu.Lock()
-	n := s.workerCount
-	if n < 1 {
-		n = 1
-	}
 	s.workerCount = n
 	s.workerMu.Unlock()
 

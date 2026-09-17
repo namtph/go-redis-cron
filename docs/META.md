@@ -5,7 +5,7 @@ This document is the product contract for `gorediscron`. API mapping:
 | META | gorediscron |
 |------|-------------|
 | `registerJobs` | `Register(CronJobScheduler)` — **anytime**, repeatable |
-| `startWorkerPool` | `SetWorkerCount` + `StartWorkerPool(ctx)` — **not tied to Register** |
+| `startWorkerPool` | `StartWorkerPool(ctx, WorkerPoolConfig{NumberOfWorkerInstances: n})` |
 | `startLeader` (claim loop) | Started inside `StartWorkerPool` |
 | Cron tick enqueue | `StartCron` + leader; optional `StartLeaderElection` |
 
@@ -119,7 +119,7 @@ When Redis rejects writes or evicts data because **Redis itself is out of memory
 ## Implementation checklist (gorediscron)
 
 - [x] Idempotent `Register` with version-guarded Redis metadata.
-- [x] `StartWith` / `StartWorkers` / cron leader enqueue (split roles).
+- [x] `StartWorkerPool` / `StartWith` / cron leader enqueue (split roles).
 - [x] `internal.LocalQueue` + claim loop reserve-then-claim.
 - [x] Redis pending/processing + lease ZSET + `ReclaimExpired`.
 - [x] Requeue on active-lock contention and claim-loop failures.

@@ -19,7 +19,7 @@ func TestWorkerPoolBeforeRegister(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := s.StartWorkerPool(ctx); err != nil {
+	if err := s.StartWorkerPool(ctx, WorkerPoolConfig{NumberOfWorkerInstances: 2}); err != nil {
 		t.Fatal(err)
 	}
 	fn := func(ctx context.Context) error { return nil }
