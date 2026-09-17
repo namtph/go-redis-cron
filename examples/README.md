@@ -5,6 +5,7 @@ Each directory is a **complete runnable project**: `main` package, local `go.mod
 | Example | What it demonstrates |
 |---------|----------------------|
 | [full-pod](full-pod/) | Register jobs, worker pool, leader election, cron, and embedded job UI in one process |
+| [two-pods-full](two-pods-full/) | Docker Compose: Redis + **two** full pods, 2 tasks, 4 jobs every second |
 | [scheduler-pod](scheduler-pod/) | Split deployment: register jobs + cron leader only (enqueue to Redis) |
 | [worker-pod](worker-pod/) | Split deployment: claim loop + worker executors (no registration) |
 
